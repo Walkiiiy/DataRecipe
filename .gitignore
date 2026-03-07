@@ -1,0 +1,76 @@
+# ------------------------------
+# Python
+# ------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ------------------------------
+# Virtual env / Conda
+# ------------------------------
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# ------------------------------
+# Jupyter / IDE
+# ------------------------------
+.ipynb_checkpoints/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ------------------------------
+# Secrets / env files
+# ------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.token
+
+# ------------------------------
+# Logs / temp
+# ------------------------------
+*.log
+logs/
+tmp/
+.temp/
+
+# ------------------------------
+# Project data and artifacts (large)
+# ------------------------------
+/data/
+
+# Keep model README if needed, ignore all weights/checkpoints
+/model/*
+!/model/README.md
+
+# Training outputs / trajectories / checkpoints
+**/outputs/
+**/checkpoints/
+**/weight_trajectory/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Hugging Face / cache
+.huggingface/
+.cache/
+
+# Misc
+*.bak
+*.tmp
