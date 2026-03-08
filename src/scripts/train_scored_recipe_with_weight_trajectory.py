@@ -80,8 +80,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--anchor_dir",
         type=str,
-        default=None,
-        help="Optional directory for capability-anchor data. If not set, use train_dir.",
+        default="/home/walkiiiy/DataRecipe/data/flan/niv2_capability_data_ramdom1000_preprocessed/capability_anchors",
+        help="Directory for capability-anchor data (recommended: .../capability_anchors).",
     )
     parser.add_argument(
         "--anchor_refresh_every",
@@ -190,10 +190,23 @@ class ScoredResponseOnlyDataset(IterableDataset):
         if all(x == -100 for x in labels):
             return None
 
+        metric_keys = [
+            ("相关度",),
+            ("准确性",),
+            ("能力多样性", "多样性"),
+            ("难度",),
+        ]
         metrics = []
-        for k in ("相关度", "准确性", "能力多样性", "难度"):
+        for key_group in metric_keys:
+            found = None
+            for k in key_group:
+                if k in ex and ex.get(k) not in (None, ""):
+                    found = ex.get(k)
+                    break
+            if found is None:
+                return None
             try:
-                metrics.append(float(ex.get(k, "")))
+                metrics.append(float(found))
             except Exception:
                 return None
 
@@ -481,7 +494,16 @@ def main() -> None:
 
     recorder = AlphaTrajectoryRecorder(args.output_dir)
     alpha = torch.full((4,), 0.25, dtype=torch.float32, device=device)
-    anchor_files = list_jsonl_files(args.anchor_dir) if args.anchor_dir else files
+    anchor_files: List[str]
+    anchor_dir = Path(args.anchor_dir) if args.anchor_dir else None
+    if anchor_dir is not None and anchor_dir.exists():
+        anchor_files = list_jsonl_files(str(anchor_dir))
+    else:
+        print(
+            f"[Warn] anchor_dir not found ({args.anchor_dir}), fallback to train_dir for anchors.",
+            flush=True,
+        )
+        anchor_files = files
     anchor_pool = build_anchor_pool(
         files=anchor_files,
         tokenizer=tokenizer,
@@ -489,7 +511,8 @@ def main() -> None:
         per_capability_limit=args.anchor_samples_per_capability,
     )
     print(
-        f"[Init] anchor_dir={args.anchor_dir or args.train_dir} anchor_caps={len(anchor_pool)} "
+        f"[Init] anchor_dir={(str(anchor_dir) if (anchor_dir and anchor_dir.exists()) else args.train_dir)} "
+        f"anchor_caps={len(anchor_pool)} "
         f"refresh_every={args.anchor_refresh_every} "
         f"samples_per_cap={args.anchor_samples_per_capability}",
         flush=True,
