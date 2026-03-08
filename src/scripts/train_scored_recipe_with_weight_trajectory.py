@@ -1,16 +1,16 @@
-"""Train on scored FLAN data and record full weight trajectory.
+"""Train on scored FLAN data and record alpha (4-metric) trajectory.
 
 Features:
 - Train on `niv2_capability_data_random1000_alphagasus_scored` style jsonl.
 - Response-only loss masking (prompt tokens masked to -100).
-- Record full model weights over time by saving state_dict every optimizer step.
-
-Note: saving full state_dict each step is storage-intensive by design.
+- Maintain dynamic alpha weights for 4 scored dimensions.
+- Record only alpha/loss/lr per optimizer step.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, IterableDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -32,7 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train on scored data with full weight trajectory logging")
+    parser = argparse.ArgumentParser(description="Train on scored data with alpha trajectory logging")
 
     parser.add_argument(
         "--train_dir",
@@ -61,19 +62,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_steps", type=int, default=None)
 
     parser.add_argument("--log_every", type=int, default=10)
-
-    # Trajectory controls
-    parser.add_argument(
-        "--record_every_step",
-        action="store_true",
-        help="If set, save full state_dict at every optimizer step.",
-    )
-    parser.add_argument(
-        "--save_weight_every",
-        type=int,
-        default=1,
-        help="Save full state_dict every N optimizer steps (used when record_every_step is not set).",
-    )
+    parser.add_argument("--gamma", type=float, default=0.8, help="MWU update scale for alpha.")
+    parser.add_argument("--epsilon", type=float, default=0.05, help="Entropy regularization for alpha.")
 
     return parser.parse_args()
 
@@ -99,6 +89,7 @@ def build_prompt(instruction: str, inp: str) -> str:
 class PackedSample:
     input_ids: List[int]
     labels: List[int]
+    metrics: List[float]
 
 
 class ScoredResponseOnlyDataset(IterableDataset):
@@ -167,7 +158,14 @@ class ScoredResponseOnlyDataset(IterableDataset):
         if all(x == -100 for x in labels):
             return None
 
-        return PackedSample(input_ids=input_ids, labels=labels)
+        metrics = []
+        for k in ("相关度", "准确性", "能力多样性", "难度"):
+            try:
+                metrics.append(float(ex.get(k, "")))
+            except Exception:
+                return None
+
+        return PackedSample(input_ids=input_ids, labels=labels, metrics=metrics)
 
     def __iter__(self) -> Iterator[PackedSample]:
         files = list(self.files)
@@ -192,18 +190,20 @@ class ScoredResponseOnlyDataset(IterableDataset):
 def collate_fn(batch: List[PackedSample], pad_id: int) -> Dict[str, torch.Tensor]:
     max_len = max(len(x.input_ids) for x in batch)
 
-    input_ids, labels, attention_mask = [], [], []
+    input_ids, labels, attention_mask, metrics = [], [], [], []
     for x in batch:
         cur = len(x.input_ids)
         pad = max_len - cur
         input_ids.append(x.input_ids + [pad_id] * pad)
         labels.append(x.labels + [-100] * pad)
         attention_mask.append([1] * cur + [0] * pad)
+        metrics.append(x.metrics)
 
     return {
         "input_ids": torch.tensor(input_ids, dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        "metrics": torch.tensor(metrics, dtype=torch.float32),
     }
 
 
@@ -241,21 +241,69 @@ def estimate_steps(files: List[str], batch_size: int, grad_accum: int, epochs: i
     return total
 
 
-class WeightTrajectoryRecorder:
-    """Persist full state_dict snapshots and step metadata."""
+class AlphaTrajectoryRecorder:
+    """Persist alpha/loss/lr step metadata."""
 
     def __init__(self, output_dir: str) -> None:
         self.output_dir = Path(output_dir)
-        self.traj_dir = self.output_dir / "weight_trajectory"
+        self.traj_dir = self.output_dir / "alpha_trajectory"
         self.traj_dir.mkdir(parents=True, exist_ok=True)
         self.meta_path = self.traj_dir / "trajectory_meta.jsonl"
+        self.csv_path = self.traj_dir / "trajectory_meta.csv"
+        with self.csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["step", "loss", "lr", "tag", "alpha_0", "alpha_1", "alpha_2", "alpha_3"],
+            )
+            writer.writeheader()
 
-    def save(self, model: torch.nn.Module, step: int, loss: float, lr: float, tag: str = "step") -> None:
-        ckpt_path = self.traj_dir / f"{tag}_{step:08d}.pt"
-        state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        torch.save(state, ckpt_path)
+    def save(self, step: int, loss: float, lr: float, alpha: torch.Tensor, tag: str = "step") -> None:
+        alpha_vals = alpha.detach().cpu().tolist()
+        row = {
+            "step": int(step),
+            "loss": float(loss),
+            "lr": float(lr),
+            "tag": str(tag),
+            "alpha_0": float(alpha_vals[0]),
+            "alpha_1": float(alpha_vals[1]),
+            "alpha_2": float(alpha_vals[2]),
+            "alpha_3": float(alpha_vals[3]),
+        }
         with self.meta_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"step": step, "loss": loss, "lr": lr, "file": ckpt_path.name, "tag": tag}) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with self.csv_path.open("a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["step", "loss", "lr", "tag", "alpha_0", "alpha_1", "alpha_2", "alpha_3"],
+            )
+            writer.writerow(row)
+
+
+def per_sample_response_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Per-sample response-only CE loss.
+
+    logits: (B, T, V), labels: (B, T) with -100 masked tokens.
+    returns: (B,)
+    """
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    tok_loss = F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        shift_labels.view(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).view(shift_labels.size(0), shift_labels.size(1))
+    valid = (shift_labels != -100).to(tok_loss.dtype)
+    denom = valid.sum(dim=1).clamp_min(1.0)
+    return (tok_loss * valid).sum(dim=1) / denom
+
+
+def update_alpha(alpha: torch.Tensor, rewards: torch.Tensor, batch_metrics: torch.Tensor, gamma: float, epsilon: float) -> torch.Tensor:
+    """Batch-smoothed MWU alpha update."""
+    utilities = (rewards.unsqueeze(1) * batch_metrics).mean(dim=0)
+    alpha_tilde = alpha * torch.exp(gamma * utilities)
+    alpha_norm = alpha_tilde / alpha_tilde.sum().clamp_min(1e-12)
+    return (1.0 - epsilon) * alpha_norm + epsilon / 4.0
 
 
 def main() -> None:
@@ -308,24 +356,28 @@ def main() -> None:
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(torch.cuda.is_available() and args.fp16))
 
-    recorder = WeightTrajectoryRecorder(args.output_dir)
+    recorder = AlphaTrajectoryRecorder(args.output_dir)
+    alpha = torch.full((4,), 0.25, dtype=torch.float32, device=device)
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    # Save initial weights (step 0)
-    recorder.save(model, step=0, loss=float("nan"), lr=optimizer.param_groups[0]["lr"], tag="init")
-    print("[Init] saved initial weight snapshot", flush=True)
+    # Save initial alpha (step 0)
+    recorder.save(step=0, loss=float("nan"), lr=optimizer.param_groups[0]["lr"], alpha=alpha, tag="init")
+    print("[Init] saved initial alpha snapshot", flush=True)
 
     global_step = 0
     micro_step = 0
     running_loss = 0.0
+    reward_buffer: List[torch.Tensor] = []
+    metric_buffer: List[torch.Tensor] = []
 
     for epoch in range(args.num_epochs):
         print(f"[Epoch] {epoch+1}/{args.num_epochs} start", flush=True)
         for batch in loader:
             micro_step += 1
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+            batch_metrics = batch.pop("metrics")
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = model(**batch)
@@ -335,6 +387,12 @@ def main() -> None:
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
+
+            with torch.no_grad():
+                sample_loss = per_sample_response_loss(outputs.logits.detach(), batch["labels"])
+                rewards = torch.exp(-sample_loss).clamp_min(1e-8)
+                reward_buffer.append(rewards)
+                metric_buffer.append(batch_metrics.detach())
 
             running_loss += loss.item() * args.grad_accum_steps
 
@@ -355,15 +413,25 @@ def main() -> None:
                 cur_lr = optimizer.param_groups[0]["lr"]
                 cur_loss = running_loss / max(1, args.log_every)
 
-                # Record full weights each step (or every N steps).
-                save_now = args.record_every_step or (global_step % max(1, args.save_weight_every) == 0)
-                if save_now:
-                    recorder.save(model, step=global_step, loss=cur_loss, lr=cur_lr, tag="step")
+                if reward_buffer:
+                    batch_rewards = torch.cat(reward_buffer, dim=0)
+                    batch_metrics_all = torch.cat(metric_buffer, dim=0)
+                    alpha = update_alpha(
+                        alpha=alpha,
+                        rewards=batch_rewards,
+                        batch_metrics=batch_metrics_all,
+                        gamma=args.gamma,
+                        epsilon=args.epsilon,
+                    )
+                    reward_buffer.clear()
+                    metric_buffer.clear()
+
+                recorder.save(step=global_step, loss=cur_loss, lr=cur_lr, alpha=alpha, tag="step")
 
                 if global_step % args.log_every == 0:
                     print(
                         f"[Train] epoch={epoch+1} step={global_step}/{total_steps} "
-                        f"loss={cur_loss:.6f} lr={cur_lr:.8f}",
+                        f"loss={cur_loss:.6f} lr={cur_lr:.8f} alpha={[round(x, 6) for x in alpha.detach().cpu().tolist()]}",
                         flush=True,
                     )
                     running_loss = 0.0
@@ -378,7 +446,7 @@ def main() -> None:
     model.save_pretrained(args.output_dir)
     tokenizer.save_pretrained(args.output_dir)
     print(f"[Done] model saved to {args.output_dir}", flush=True)
-    print(f"[Done] weight trajectory dir: {Path(args.output_dir) / 'weight_trajectory'}", flush=True)
+    print(f"[Done] alpha trajectory dir: {Path(args.output_dir) / 'alpha_trajectory'}", flush=True)
 
 
 if __name__ == "__main__":

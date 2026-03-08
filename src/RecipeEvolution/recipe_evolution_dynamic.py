@@ -10,7 +10,10 @@ Includes a runnable dummy demo in ``main()``.
 
 from __future__ import annotations
 
+import csv
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -297,6 +300,8 @@ class RecipeEvolution:
         self.m_pool = m_pool
         self.gamma = gamma
         self.epsilon = epsilon
+        self.step_idx = 0
+        self.alpha_history = [self.selector.alpha.detach().clone().cpu()]
 
     def step(self, batch_size: int) -> Dict[str, torch.Tensor | float]:
         batch = self.selector.select_topk(self.x_pool, self.y_pool, self.m_pool, k=batch_size)
@@ -307,11 +312,50 @@ class RecipeEvolution:
             gamma=self.gamma,
             epsilon=self.epsilon,
         )
+        self.step_idx += 1
+        self.alpha_history.append(alpha.detach().clone().cpu())
         return {
+            "step": self.step_idx,
             "train_loss": train_loss,
             "avg_reward": float(rewards.mean().item()),
             "alpha": alpha.detach().clone(),
         }
+
+    def dump_alpha_trajectory(self, output_dir: str | Path) -> Tuple[Path, Path]:
+        """Persist alpha trajectory for analysis.
+
+        Output files:
+            alpha_trajectory.jsonl: one row per step with alpha_0..alpha_3
+            alpha_trajectory.csv: same content in CSV format
+        """
+        out_dir = Path(output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        jsonl_path = out_dir / "alpha_trajectory.jsonl"
+        csv_path = out_dir / "alpha_trajectory.csv"
+
+        rows = []
+        for step, alpha in enumerate(self.alpha_history):
+            a = alpha.tolist()
+            rows.append(
+                {
+                    "step": step,
+                    "alpha_0": float(a[0]),
+                    "alpha_1": float(a[1]),
+                    "alpha_2": float(a[2]),
+                    "alpha_3": float(a[3]),
+                }
+            )
+
+        with jsonl_path.open("w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["step", "alpha_0", "alpha_1", "alpha_2", "alpha_3"])
+            writer.writeheader()
+            writer.writerows(rows)
+
+        return jsonl_path, csv_path
 
 
 def main() -> None:
@@ -353,9 +397,14 @@ def main() -> None:
     for epoch in range(1, 6):
         stats = evolution.step(batch_size=32)
         print(
-            f"epoch={epoch} loss={stats['train_loss']:.4f} "
+            f"step={stats['step']} epoch={epoch} loss={stats['train_loss']:.4f} "
             f"avg_reward={stats['avg_reward']:.4f} alpha={stats['alpha'].tolist()}"
         )
+    jsonl_path, csv_path = evolution.dump_alpha_trajectory(
+        output_dir=Path(__file__).resolve().parents[2] / "model" / "recipe_evolution_alpha_demo"
+    )
+    print(f"alpha trajectory jsonl: {jsonl_path}")
+    print(f"alpha trajectory csv: {csv_path}")
 
 
 if __name__ == "__main__":
