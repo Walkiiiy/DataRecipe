@@ -96,6 +96,12 @@ def parse_args() -> argparse.Namespace:
         help="Max anchor samples used per capability when building anchor pool.",
     )
     parser.add_argument(
+        "--anchor_batch_size",
+        type=int,
+        default=1,
+        help="Micro-batch size when computing capability anchor gradients.",
+    )
+    parser.add_argument(
         "--alpha_utility_norm",
         type=str,
         default="zscore",
@@ -524,24 +530,50 @@ def compute_capability_anchor_grads(
     tokenizer: AutoTokenizer,
     anchor_pool: Dict[str, List[PackedSample]],
     device: torch.device,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+    anchor_batch_size: int,
 ) -> Dict[str, torch.Tensor]:
     """Compute latest normalized anchor gradients per capability."""
     grads: Dict[str, torch.Tensor] = {}
     pad_id = tokenizer.pad_token_id
+    if anchor_batch_size < 1:
+        raise ValueError("--anchor_batch_size must be >= 1")
+    grad_params = [model.lm_head.weight] + ([model.lm_head.bias] if model.lm_head.bias is not None else [])
     for cap, samples in anchor_pool.items():
         if not samples:
             continue
-        batch = collate_fn(samples, pad_id)
-        t_batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor) and k != "metrics"}
-        model.zero_grad(set_to_none=True)
-        out = model(
-            input_ids=t_batch["input_ids"],
-            attention_mask=t_batch["attention_mask"],
-            labels=t_batch["labels"],
-        )
-        out.loss.backward()
-        grads[cap] = flatten_last_layer_grad(model).detach().clone()
-        model.zero_grad(set_to_none=True)
+        cap_vec: Optional[torch.Tensor] = None
+        cap_count = 0
+        for st in range(0, len(samples), anchor_batch_size):
+            mini = samples[st : st + anchor_batch_size]
+            batch = collate_fn(mini, pad_id)
+            t_batch = {k: v.to(device, non_blocking=True) for k, v in batch.items() if isinstance(v, torch.Tensor) and k != "metrics"}
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                out = model(
+                    input_ids=t_batch["input_ids"],
+                    attention_mask=t_batch["attention_mask"],
+                    labels=t_batch["labels"],
+                )
+            g = torch.autograd.grad(
+                out.loss,
+                grad_params,
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+            )
+            g_w = torch.zeros_like(model.lm_head.weight) if g[0] is None else g[0]
+            flat = g_w.reshape(-1)
+            if model.lm_head.bias is not None:
+                g_b = torch.zeros_like(model.lm_head.bias) if g[1] is None else g[1]
+                flat = torch.cat([flat, g_b.reshape(-1)], dim=0)
+            cur = flat / flat.norm().clamp_min(1e-12)
+            cap_vec = cur if cap_vec is None else (cap_vec + cur)
+            cap_count += 1
+            del out, g, t_batch, batch
+        if cap_vec is not None and cap_count > 0:
+            cap_vec = cap_vec / cap_count
+            grads[cap] = cap_vec / cap_vec.norm().clamp_min(1e-12)
     return grads
 
 
@@ -669,6 +701,9 @@ def main() -> None:
         tokenizer=tokenizer,
         anchor_pool=anchor_pool,
         device=device,
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+        anchor_batch_size=args.anchor_batch_size,
     )
     global_anchor = None
     if anchor_grads:
@@ -700,6 +735,9 @@ def main() -> None:
                         tokenizer=tokenizer,
                         anchor_pool=anchor_pool,
                         device=device,
+                        use_amp=use_amp,
+                        amp_dtype=amp_dtype,
+                        anchor_batch_size=args.anchor_batch_size,
                     )
                     if anchor_grads:
                         global_anchor = torch.stack(list(anchor_grads.values()), dim=0).mean(dim=0)
