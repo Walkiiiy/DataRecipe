@@ -64,6 +64,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log_every", type=int, default=10)
     parser.add_argument("--gamma", type=float, default=0.8, help="MWU update scale for alpha.")
     parser.add_argument("--epsilon", type=float, default=0.05, help="Entropy regularization for alpha.")
+    parser.add_argument(
+        "--alpha_data_mode",
+        type=str,
+        default="none",
+        choices=["none", "loss_weight", "topk", "topk_loss_weight"],
+        help="How alpha affects data/training each micro-step.",
+    )
+    parser.add_argument(
+        "--topk_ratio",
+        type=float,
+        default=1.0,
+        help="Keep top-k ratio by alpha-weighted quality when mode includes topk.",
+    )
 
     return parser.parse_args()
 
@@ -309,11 +322,17 @@ def update_alpha(alpha: torch.Tensor, rewards: torch.Tensor, batch_metrics: torc
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
+    if not (0.0 < args.topk_ratio <= 1.0):
+        raise ValueError("--topk_ratio must be in (0, 1].")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[Init] device={device}", flush=True)
+    print(
+        f"[Init] alpha_data_mode={args.alpha_data_mode} topk_ratio={args.topk_ratio}",
+        flush=True,
+    )
 
     files = list_jsonl_files(args.train_dir)
     print(f"[Init] train_files={len(files)} train_dir={args.train_dir}", flush=True)
@@ -379,9 +398,27 @@ def main() -> None:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             batch_metrics = batch.pop("metrics")
 
+            # Alpha-conditioned quality score for this micro-batch.
+            quality_scores = batch_metrics @ alpha
+            if args.alpha_data_mode in ("topk", "topk_loss_weight"):
+                total = quality_scores.size(0)
+                k = max(1, int(math.ceil(total * args.topk_ratio)))
+                if k < total:
+                    topk_idx = torch.topk(quality_scores, k=k, dim=0, largest=True).indices
+                    batch = {k: v.index_select(0, topk_idx) for k, v in batch.items()}
+                    batch_metrics = batch_metrics.index_select(0, topk_idx)
+                    quality_scores = quality_scores.index_select(0, topk_idx)
+
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = model(**batch)
-                loss = outputs.loss / args.grad_accum_steps
+                sample_loss = per_sample_response_loss(outputs.logits, batch["labels"])
+                if args.alpha_data_mode in ("loss_weight", "topk_loss_weight"):
+                    weights = quality_scores.clamp_min(1e-8)
+                    weights = weights / weights.sum().clamp_min(1e-8)
+                    train_loss = (sample_loss * weights).sum()
+                else:
+                    train_loss = outputs.loss
+                loss = train_loss / args.grad_accum_steps
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -389,8 +426,7 @@ def main() -> None:
                 loss.backward()
 
             with torch.no_grad():
-                sample_loss = per_sample_response_loss(outputs.logits.detach(), batch["labels"])
-                rewards = torch.exp(-sample_loss).clamp_min(1e-8)
+                rewards = torch.exp(-sample_loss.detach()).clamp_min(1e-8)
                 reward_buffer.append(rewards)
                 metric_buffer.append(batch_metrics.detach())
 
