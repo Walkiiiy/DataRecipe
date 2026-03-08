@@ -95,6 +95,44 @@ def parse_args() -> argparse.Namespace:
         default=2,
         help="Max anchor samples used per capability when building anchor pool.",
     )
+    parser.add_argument(
+        "--alpha_utility_norm",
+        type=str,
+        default="zscore",
+        choices=["none", "center", "zscore"],
+        help="Normalize utility vector before MWU update to reduce single-dimension collapse.",
+    )
+    parser.add_argument(
+        "--alpha_metric_baseline",
+        type=str,
+        default="dataset",
+        choices=["none", "dataset"],
+        help="Baseline used to debias metrics when computing utility.",
+    )
+    parser.add_argument(
+        "--alpha_logit_clip",
+        type=float,
+        default=5.0,
+        help="Clip normalized utility into [-clip, clip] before exp; <=0 disables.",
+    )
+    parser.add_argument(
+        "--alpha_utility_ema",
+        type=float,
+        default=0.9,
+        help="EMA factor for utility smoothing in [0,1). Larger means smoother.",
+    )
+    parser.add_argument(
+        "--alpha_step_size",
+        type=float,
+        default=0.2,
+        help="Interpolation step size from previous alpha to proposed alpha in (0,1].",
+    )
+    parser.add_argument(
+        "--alpha_floor",
+        type=float,
+        default=0.05,
+        help="Per-dimension minimum alpha floor after update. Set 0 to disable.",
+    )
 
     return parser.parse_args()
 
@@ -357,6 +395,40 @@ def update_alpha(alpha: torch.Tensor, rewards: torch.Tensor, batch_metrics: torc
     return (1.0 - epsilon) * alpha_norm + epsilon / 4.0
 
 
+def estimate_metric_mean(files: List[str]) -> torch.Tensor:
+    keys = ("相关度", "准确性", "能力多样性", "难度")
+    sums = torch.zeros(4, dtype=torch.float64)
+    count = 0
+    for fp in files:
+        with open(fp, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ex = json.loads(line)
+                    vals = [float(ex.get(k, "")) for k in keys]
+                except Exception:
+                    continue
+                sums += torch.tensor(vals, dtype=torch.float64)
+                count += 1
+    if count == 0:
+        return torch.zeros(4, dtype=torch.float32)
+    return (sums / count).to(torch.float32)
+
+
+def normalize_utilities(utilities: torch.Tensor, mode: str, clip_value: float) -> torch.Tensor:
+    out = utilities
+    if mode == "center":
+        out = out - out.mean()
+    elif mode == "zscore":
+        out = out - out.mean()
+        out = out / out.std(unbiased=False).clamp_min(1e-6)
+    if clip_value > 0:
+        out = out.clamp(min=-clip_value, max=clip_value)
+    return out
+
+
 def build_anchor_pool(
     files: List[str],
     tokenizer: AutoTokenizer,
@@ -365,16 +437,75 @@ def build_anchor_pool(
 ) -> Dict[str, List[PackedSample]]:
     """Build a small capability->samples pool for anchor gradient refresh."""
     pool: Dict[str, List[PackedSample]] = {}
-    ds = ScoredResponseOnlyDataset(
-        files=files,
-        tokenizer=tokenizer,
-        max_seq_len=max_seq_len,
-        shuffle_files_each_epoch=False,
-    )
-    for sample in ds:
-        bucket = pool.setdefault(sample.anchor_key, [])
-        if len(bucket) < per_capability_limit:
-            bucket.append(sample)
+
+    def encode_anchor_example(ex: Dict, fallback_anchor_key: str) -> Optional[PackedSample]:
+        instruction = str(ex.get("instruction", ""))
+        inp = str(ex.get("input", ""))
+        response = str(ex.get("response", ""))
+        if not response.strip():
+            return None
+
+        prefix_text = build_prompt(instruction, inp)
+        full_text = prefix_text + response
+
+        prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+        full_ids = tokenizer.encode(full_text, add_special_tokens=False)
+
+        input_ids: List[int] = []
+        labels: List[int] = []
+
+        bos_id = tokenizer.bos_token_id
+        eos_id = tokenizer.eos_token_id
+        if eos_id is None:
+            return None
+
+        if bos_id is not None:
+            input_ids.append(bos_id)
+            labels.append(-100)
+
+        input_ids.extend(full_ids)
+        response_start = (1 if bos_id is not None else 0) + len(prefix_ids)
+        labels.extend([-100] * len(full_ids))
+        if response_start >= len(input_ids):
+            return None
+
+        for i in range(response_start, len(input_ids)):
+            labels[i] = input_ids[i]
+
+        input_ids.append(eos_id)
+        labels.append(eos_id)
+
+        if len(input_ids) > max_seq_len:
+            input_ids = input_ids[:max_seq_len]
+            labels = labels[:max_seq_len]
+        if all(x == -100 for x in labels):
+            return None
+
+        anchor_key = str(ex.get("能力锚点属性") or ex.get("capability_tag") or ex.get("task_name") or fallback_anchor_key)
+        if not anchor_key:
+            return None
+
+        # Anchor gradients do not depend on static metric scores.
+        return PackedSample(input_ids=input_ids, labels=labels, metrics=[0.0, 0.0, 0.0, 0.0], anchor_key=anchor_key)
+
+    for fp in files:
+        p = Path(fp)
+        fallback_key = p.stem
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ex = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sample = encode_anchor_example(ex, fallback_key)
+                if sample is None:
+                    continue
+                bucket = pool.setdefault(sample.anchor_key, [])
+                if len(bucket) < per_capability_limit:
+                    bucket.append(sample)
     return pool
 
 
@@ -441,6 +572,12 @@ def main() -> None:
     set_seed(args.seed)
     if not (0.0 < args.topk_ratio <= 1.0):
         raise ValueError("--topk_ratio must be in (0, 1].")
+    if not (0.0 <= args.alpha_utility_ema < 1.0):
+        raise ValueError("--alpha_utility_ema must be in [0, 1).")
+    if not (0.0 < args.alpha_step_size <= 1.0):
+        raise ValueError("--alpha_step_size must be in (0, 1].")
+    if not (0.0 <= args.alpha_floor < 0.25):
+        raise ValueError("--alpha_floor must be in [0, 0.25).")
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -450,9 +587,18 @@ def main() -> None:
         f"[Init] alpha_data_mode={args.alpha_data_mode} topk_ratio={args.topk_ratio}",
         flush=True,
     )
+    print(
+        f"[Init] alpha_utility_norm={args.alpha_utility_norm} alpha_utility_ema={args.alpha_utility_ema} "
+        f"alpha_step_size={args.alpha_step_size} alpha_floor={args.alpha_floor}",
+        flush=True,
+    )
 
     files = list_jsonl_files(args.train_dir)
     print(f"[Init] train_files={len(files)} train_dir={args.train_dir}", flush=True)
+    metric_baseline = torch.zeros(4, dtype=torch.float32)
+    if args.alpha_metric_baseline == "dataset":
+        metric_baseline = estimate_metric_mean(files)
+    print(f"[Init] metric_baseline={metric_baseline.tolist()}", flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
     if tokenizer.pad_token_id is None:
@@ -460,6 +606,7 @@ def main() -> None:
 
     model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
     model.to(device)
+    metric_baseline = metric_baseline.to(device)
 
     dataset = ScoredResponseOnlyDataset(
         files=files,
@@ -540,6 +687,7 @@ def main() -> None:
     running_loss = 0.0
     reward_buffer: List[torch.Tensor] = []
     metric_buffer: List[torch.Tensor] = []
+    utility_ema: Optional[torch.Tensor] = None
 
     for epoch in range(args.num_epochs):
         print(f"[Epoch] {epoch+1}/{args.num_epochs} start", flush=True)
@@ -578,7 +726,10 @@ def main() -> None:
                 outputs = model(**batch)
                 sample_loss = per_sample_response_loss(outputs.logits, batch["labels"])
                 if args.alpha_data_mode in ("loss_weight", "topk_loss_weight"):
-                    weights = quality_scores.clamp_min(1e-8)
+                    weights = quality_scores
+                    if torch.any(weights <= 0):
+                        weights = weights - weights.min() + 1e-6
+                    weights = weights.clamp_min(1e-8)
                     weights = weights / weights.sum().clamp_min(1e-8)
                     train_loss = (sample_loss * weights).sum()
                 else:
@@ -627,13 +778,29 @@ def main() -> None:
                 if reward_buffer:
                     batch_rewards = torch.cat(reward_buffer, dim=0)
                     batch_metrics_all = torch.cat(metric_buffer, dim=0)
-                    alpha = update_alpha(
-                        alpha=alpha,
-                        rewards=batch_rewards,
-                        batch_metrics=batch_metrics_all,
-                        gamma=args.gamma,
-                        epsilon=args.epsilon,
+                    metrics_for_update = batch_metrics_all
+                    if args.alpha_metric_baseline == "dataset":
+                        metrics_for_update = metrics_for_update - metric_baseline.unsqueeze(0)
+                    utilities = (batch_rewards.unsqueeze(1) * metrics_for_update).mean(dim=0)
+                    utilities = normalize_utilities(
+                        utilities=utilities,
+                        mode=args.alpha_utility_norm,
+                        clip_value=args.alpha_logit_clip,
                     )
+                    if utility_ema is None:
+                        utility_ema = utilities
+                    else:
+                        utility_ema = args.alpha_utility_ema * utility_ema + (1.0 - args.alpha_utility_ema) * utilities
+
+                    logits = torch.log(alpha.clamp_min(1e-12)) + args.gamma * utility_ema
+                    alpha_prop = torch.softmax(logits, dim=0)
+                    alpha = (1.0 - args.alpha_step_size) * alpha + args.alpha_step_size * alpha_prop
+
+                    if args.alpha_floor > 0:
+                        alpha = alpha.clamp_min(args.alpha_floor)
+                        alpha = alpha / alpha.sum().clamp_min(1e-12)
+
+                    alpha = (1.0 - args.epsilon) * alpha + args.epsilon / 4.0
                     reward_buffer.clear()
                     metric_buffer.clear()
 
