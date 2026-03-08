@@ -18,7 +18,7 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -77,6 +77,24 @@ def parse_args() -> argparse.Namespace:
         default=1.0,
         help="Keep top-k ratio by alpha-weighted quality when mode includes topk.",
     )
+    parser.add_argument(
+        "--anchor_dir",
+        type=str,
+        default=None,
+        help="Optional directory for capability-anchor data. If not set, use train_dir.",
+    )
+    parser.add_argument(
+        "--anchor_refresh_every",
+        type=int,
+        default=5,
+        help="Refresh capability anchor gradients every N optimizer steps.",
+    )
+    parser.add_argument(
+        "--anchor_samples_per_capability",
+        type=int,
+        default=2,
+        help="Max anchor samples used per capability when building anchor pool.",
+    )
 
     return parser.parse_args()
 
@@ -103,6 +121,7 @@ class PackedSample:
     input_ids: List[int]
     labels: List[int]
     metrics: List[float]
+    anchor_key: str
 
 
 class ScoredResponseOnlyDataset(IterableDataset):
@@ -178,7 +197,11 @@ class ScoredResponseOnlyDataset(IterableDataset):
             except Exception:
                 return None
 
-        return PackedSample(input_ids=input_ids, labels=labels, metrics=metrics)
+        anchor_key = str(ex.get("能力锚点属性") or ex.get("capability_tag") or ex.get("task_name") or "")
+        if not anchor_key:
+            return None
+
+        return PackedSample(input_ids=input_ids, labels=labels, metrics=metrics, anchor_key=anchor_key)
 
     def __iter__(self) -> Iterator[PackedSample]:
         files = list(self.files)
@@ -203,7 +226,7 @@ class ScoredResponseOnlyDataset(IterableDataset):
 def collate_fn(batch: List[PackedSample], pad_id: int) -> Dict[str, torch.Tensor]:
     max_len = max(len(x.input_ids) for x in batch)
 
-    input_ids, labels, attention_mask, metrics = [], [], [], []
+    input_ids, labels, attention_mask, metrics, anchor_keys = [], [], [], [], []
     for x in batch:
         cur = len(x.input_ids)
         pad = max_len - cur
@@ -211,12 +234,14 @@ def collate_fn(batch: List[PackedSample], pad_id: int) -> Dict[str, torch.Tensor
         labels.append(x.labels + [-100] * pad)
         attention_mask.append([1] * cur + [0] * pad)
         metrics.append(x.metrics)
+        anchor_keys.append(x.anchor_key)
 
     return {
         "input_ids": torch.tensor(input_ids, dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
         "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         "metrics": torch.tensor(metrics, dtype=torch.float32),
+        "anchor_keys": anchor_keys,
     }
 
 
@@ -319,6 +344,85 @@ def update_alpha(alpha: torch.Tensor, rewards: torch.Tensor, batch_metrics: torc
     return (1.0 - epsilon) * alpha_norm + epsilon / 4.0
 
 
+def build_anchor_pool(
+    files: List[str],
+    tokenizer: AutoTokenizer,
+    max_seq_len: int,
+    per_capability_limit: int,
+) -> Dict[str, List[PackedSample]]:
+    """Build a small capability->samples pool for anchor gradient refresh."""
+    pool: Dict[str, List[PackedSample]] = {}
+    ds = ScoredResponseOnlyDataset(
+        files=files,
+        tokenizer=tokenizer,
+        max_seq_len=max_seq_len,
+        shuffle_files_each_epoch=False,
+    )
+    for sample in ds:
+        bucket = pool.setdefault(sample.anchor_key, [])
+        if len(bucket) < per_capability_limit:
+            bucket.append(sample)
+    return pool
+
+
+def flatten_last_layer_grad(model: torch.nn.Module) -> torch.Tensor:
+    g_w = model.lm_head.weight.grad
+    if g_w is None:
+        return torch.zeros(model.lm_head.weight.numel(), device=model.lm_head.weight.device)
+    flat = g_w.reshape(-1)
+    if model.lm_head.bias is not None and model.lm_head.bias.grad is not None:
+        flat = torch.cat([flat, model.lm_head.bias.grad.reshape(-1)], dim=0)
+    return flat / flat.norm().clamp_min(1e-12)
+
+
+def compute_capability_anchor_grads(
+    model: torch.nn.Module,
+    tokenizer: AutoTokenizer,
+    anchor_pool: Dict[str, List[PackedSample]],
+    device: torch.device,
+) -> Dict[str, torch.Tensor]:
+    """Compute latest normalized anchor gradients per capability."""
+    grads: Dict[str, torch.Tensor] = {}
+    pad_id = tokenizer.pad_token_id
+    for cap, samples in anchor_pool.items():
+        if not samples:
+            continue
+        batch = collate_fn(samples, pad_id)
+        t_batch = {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor) and k != "metrics"}
+        model.zero_grad(set_to_none=True)
+        out = model(
+            input_ids=t_batch["input_ids"],
+            attention_mask=t_batch["attention_mask"],
+            labels=t_batch["labels"],
+        )
+        out.loss.backward()
+        grads[cap] = flatten_last_layer_grad(model).detach().clone()
+        model.zero_grad(set_to_none=True)
+    return grads
+
+
+def per_sample_last_layer_grads(model: torch.nn.Module, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Compute per-sample normalized grads for lm_head."""
+    sample_losses = per_sample_response_loss(logits, labels)
+    grads: List[torch.Tensor] = []
+    grad_params = [model.lm_head.weight] + ([model.lm_head.bias] if model.lm_head.bias is not None else [])
+    for i in range(sample_losses.size(0)):
+        g = torch.autograd.grad(
+            sample_losses[i],
+            grad_params,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )
+        g_w = torch.zeros_like(model.lm_head.weight) if g[0] is None else g[0]
+        flat = g_w.reshape(-1)
+        if model.lm_head.bias is not None:
+            g_b = torch.zeros_like(model.lm_head.bias) if g[1] is None else g[1]
+            flat = torch.cat([flat, g_b.reshape(-1)], dim=0)
+        grads.append(flat / flat.norm().clamp_min(1e-12))
+    return torch.stack(grads, dim=0)
+
+
 def main() -> None:
     args = parse_args()
     set_seed(args.seed)
@@ -377,6 +481,29 @@ def main() -> None:
 
     recorder = AlphaTrajectoryRecorder(args.output_dir)
     alpha = torch.full((4,), 0.25, dtype=torch.float32, device=device)
+    anchor_files = list_jsonl_files(args.anchor_dir) if args.anchor_dir else files
+    anchor_pool = build_anchor_pool(
+        files=anchor_files,
+        tokenizer=tokenizer,
+        max_seq_len=args.max_seq_len,
+        per_capability_limit=args.anchor_samples_per_capability,
+    )
+    print(
+        f"[Init] anchor_dir={args.anchor_dir or args.train_dir} anchor_caps={len(anchor_pool)} "
+        f"refresh_every={args.anchor_refresh_every} "
+        f"samples_per_cap={args.anchor_samples_per_capability}",
+        flush=True,
+    )
+    anchor_grads = compute_capability_anchor_grads(
+        model=model,
+        tokenizer=tokenizer,
+        anchor_pool=anchor_pool,
+        device=device,
+    )
+    global_anchor = None
+    if anchor_grads:
+        global_anchor = torch.stack(list(anchor_grads.values()), dim=0).mean(dim=0)
+        global_anchor = global_anchor / global_anchor.norm().clamp_min(1e-12)
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -395,6 +522,19 @@ def main() -> None:
         print(f"[Epoch] {epoch+1}/{args.num_epochs} start", flush=True)
         for batch in loader:
             micro_step += 1
+            if (micro_step - 1) % args.grad_accum_steps == 0:
+                if (global_step % max(1, args.anchor_refresh_every) == 0) or (not anchor_grads):
+                    anchor_grads = compute_capability_anchor_grads(
+                        model=model,
+                        tokenizer=tokenizer,
+                        anchor_pool=anchor_pool,
+                        device=device,
+                    )
+                    if anchor_grads:
+                        global_anchor = torch.stack(list(anchor_grads.values()), dim=0).mean(dim=0)
+                        global_anchor = global_anchor / global_anchor.norm().clamp_min(1e-12)
+
+            anchor_keys = list(batch.pop("anchor_keys"))
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             batch_metrics = batch.pop("metrics")
 
@@ -405,9 +545,11 @@ def main() -> None:
                 k = max(1, int(math.ceil(total * args.topk_ratio)))
                 if k < total:
                     topk_idx = torch.topk(quality_scores, k=k, dim=0, largest=True).indices
-                    batch = {k: v.index_select(0, topk_idx) for k, v in batch.items()}
+                    batch = {name: t.index_select(0, topk_idx) for name, t in batch.items()}
                     batch_metrics = batch_metrics.index_select(0, topk_idx)
                     quality_scores = quality_scores.index_select(0, topk_idx)
+                    keep = topk_idx.detach().cpu().tolist()
+                    anchor_keys = [anchor_keys[i] for i in keep]
 
             with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 outputs = model(**batch)
@@ -420,13 +562,23 @@ def main() -> None:
                     train_loss = outputs.loss
                 loss = train_loss / args.grad_accum_steps
 
+            g_samples = per_sample_last_layer_grads(model, outputs.logits, batch["labels"])
+
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
 
             with torch.no_grad():
-                rewards = torch.exp(-sample_loss.detach()).clamp_min(1e-8)
+                anchor_vecs: List[torch.Tensor] = []
+                for key in anchor_keys:
+                    g_ref = anchor_grads.get(key, global_anchor)
+                    if g_ref is None:
+                        g_ref = torch.ones(g_samples.size(1), device=device)
+                        g_ref = g_ref / g_ref.norm().clamp_min(1e-12)
+                    anchor_vecs.append(g_ref)
+                g_ref_batch = torch.stack(anchor_vecs, dim=0)
+                rewards = (g_samples * g_ref_batch).sum(dim=1).detach()
                 reward_buffer.append(rewards)
                 metric_buffer.append(batch_metrics.detach())
 
