@@ -2,7 +2,7 @@
 
 This script:
 1) Loads samples from a JSONL dataset.
-2) Calls an OpenAI-compatible LLM API asynchronously (e.g., DeepSeek).
+2) Calls an OpenAI-compatible LLM API asynchronously in batched prompts.
 3) Produces one dense CDT description per sample (~30-50 English words).
 4) Writes output JSONL asynchronously, one line per processed sample.
 """
@@ -25,15 +25,16 @@ from tqdm.asyncio import tqdm_asyncio
 
 SYSTEM_PROMPT = (
     "You are a capability distillation engine for instruction data.\n"
-    "Given one sample with instruction, input, and output, generate exactly one English paragraph "
-    "named CDT_description (about 30-50 words).\n"
+    "Given multiple samples with instruction, input, and output, generate one English paragraph "
+    "for each sample as CDT_description (about 30-50 words).\n"
     "The paragraph must be highly abstract and de-entityized (remove concrete names, places, products, IDs).\n"
     "It must strictly cover three orthogonal dimensions:\n"
     "1) Cognition: thinking mode (reasoning, extraction, planning, creativity, etc.)\n"
     "2) Domain: knowledge area (computer science, physics, daily conversation, etc.)\n"
     "3) Task: operation objective (debugging, summarization, translation, classification, etc.)\n"
     "Output rules:\n"
-    "- Return plain text only, no JSON, no bullets, no markdown.\n"
+    "- Return STRICT JSON object only. Keys are sample IDs (string), values are CDT_description strings.\n"
+    "- No markdown, no extra keys, no explanations.\n"
     "- Keep density high and avoid filler words.\n"
     "- Keep the three dimensions explicit in one coherent paragraph."
 )
@@ -56,6 +57,8 @@ class Config:
     max_retries: int
     retry_base_delay: float
     max_tokens: int
+    batch_size: int
+    max_chars_per_field: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,13 +79,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=6)
     parser.add_argument("--retry-base-delay", type=float, default=1.0)
     parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=8, help="How many samples are packed into one prompt.")
+    parser.add_argument(
+        "--max-chars-per-field",
+        type=int,
+        default=600,
+        help="Max chars kept for instruction/input/output in prompts to control token cost.",
+    )
     return parser.parse_args()
 
 
-def sanitize_description(text: str) -> str:
+def strip_code_fence(text: str) -> str:
     cleaned = text.strip()
     cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", cleaned)
-    cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+    return re.sub(r"\n?```$", "", cleaned).strip()
+
+
+def sanitize_description(text: str) -> str:
+    cleaned = strip_code_fence(text)
     cleaned = " ".join(cleaned.split())
     if not cleaned:
         return (
@@ -93,17 +107,37 @@ def sanitize_description(text: str) -> str:
     return cleaned
 
 
-def build_user_prompt(sample: dict[str, Any]) -> str:
-    instruction = str(sample.get("instruction", "")).strip()
-    input_text = str(sample.get("input", "")).strip()
-    output_text = str(sample.get("output", "")).strip()
+def truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
+
+
+def chunk_list[T](items: list[T], chunk_size: int) -> list[list[T]]:
+    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def build_batch_user_prompt(batch: list[tuple[int, dict[str, Any]]], max_chars_per_field: int) -> str:
+    blocks: list[str] = []
+    for sid, sample in batch:
+        instruction = truncate_text(str(sample.get("instruction", "")).strip(), max_chars_per_field)
+        input_text = truncate_text(str(sample.get("input", "")).strip(), max_chars_per_field)
+        output_text = truncate_text(str(sample.get("output", "")).strip(), max_chars_per_field)
+        blocks.append(
+            f"ID={sid}\n"
+            f"Instruction:\n{instruction}\n"
+            f"Input:\n{input_text}\n"
+            f"Output:\n{output_text}\n"
+        )
+
+    ids = [str(sid) for sid, _ in batch]
     return (
-        "Read the following single instruction-tuning sample and distill capability.\n\n"
-        f"Instruction:\n{instruction}\n\n"
-        f"Input:\n{input_text}\n\n"
-        f"Output:\n{output_text}\n\n"
-        "Return only one English paragraph CDT_description (30-50 words), highly abstract, de-entityized, "
-        "and explicitly covering Cognition, Domain, and Task."
+        "Read the following instruction-tuning samples and distill capability for each sample.\n"
+        "Return STRICT JSON only: {\"sample_id\":\"CDT_description\", ...}.\n"
+        "IDs to return exactly: "
+        + ", ".join(ids)
+        + "\n\nSamples:\n"
+        + "\n".join(blocks)
     )
 
 
@@ -120,17 +154,35 @@ async def load_jsonl(path: Path, max_samples: int | None) -> list[dict[str, Any]
     return rows
 
 
-async def request_cdt(
+def parse_batch_response(raw: str, expected_ids: list[int]) -> dict[int, str]:
+    cleaned = strip_code_fence(raw)
+    data = json.loads(cleaned)
+    if not isinstance(data, dict):
+        raise ValueError("Batch output is not a JSON object.")
+
+    parsed: dict[int, str] = {}
+    for sid in expected_ids:
+        val = data.get(str(sid))
+        if val is None:
+            val = data.get(sid)
+        if val is None:
+            continue
+        parsed[sid] = sanitize_description(str(val))
+    return parsed
+
+
+async def request_cdt_batch(
     session: aiohttp.ClientSession,
     cfg: Config,
-    sample: dict[str, Any],
-) -> str:
+    batch: list[tuple[int, dict[str, Any]]],
+) -> dict[int, str]:
     url = f"{cfg.base_url.rstrip('/')}/chat/completions"
+    expected_ids = [sid for sid, _ in batch]
     payload = {
         "model": cfg.model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": build_user_prompt(sample)},
+            {"role": "user", "content": build_batch_user_prompt(batch, cfg.max_chars_per_field)},
         ],
         "temperature": 0.0,
         "max_tokens": cfg.max_tokens,
@@ -152,7 +204,10 @@ async def request_cdt(
 
                 data = json.loads(body)
                 content = data["choices"][0]["message"]["content"]
-                return sanitize_description(str(content))
+                parsed = parse_batch_response(str(content), expected_ids)
+                if not parsed:
+                    raise RuntimeError("empty parsed batch output")
+                return parsed
         except Exception:
             if attempt == cfg.max_retries:
                 break
@@ -160,29 +215,38 @@ async def request_cdt(
             jitter = random.uniform(0, 0.25 * backoff)
             await asyncio.sleep(backoff + jitter)
 
-    return (
-        "Cognition: generic instruction understanding with basic transformation and response planning. "
-        "Domain: mixed open-domain context without fixed specialized grounding. "
-        "Task: generate a concise answer that matches requested format and communicative goal."
-    )
+    return {}
 
 
-async def process_one(
-    idx: int,
-    row: dict[str, Any],
+async def process_batch(
+    batch: list[tuple[int, dict[str, Any]]],
     session: aiohttp.ClientSession,
     cfg: Config,
     semaphore: asyncio.Semaphore,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     async with semaphore:
-        cdt_text = await request_cdt(session=session, cfg=cfg, sample=row)
-    return {
-        "id": idx,
-        "instruction": row.get("instruction", ""),
-        "input": row.get("input", ""),
-        "output": row.get("output", ""),
-        "CDT_description": cdt_text,
-    }
+        parsed = await request_cdt_batch(session=session, cfg=cfg, batch=batch)
+
+    outputs: list[dict[str, Any]] = []
+    for sid, row in batch:
+        cdt_text = parsed.get(
+            sid,
+            (
+                "Cognition: generic instruction understanding with basic transformation and response planning. "
+                "Domain: mixed open-domain context without fixed specialized grounding. "
+                "Task: generate a concise answer that matches requested format and communicative goal."
+            ),
+        )
+        outputs.append(
+            {
+                "id": sid,
+                "instruction": row.get("instruction", ""),
+                "input": row.get("input", ""),
+                "output": row.get("output", ""),
+                "CDT_description": cdt_text,
+            }
+        )
+    return outputs
 
 
 async def run(cfg: Config) -> None:
@@ -195,15 +259,15 @@ async def run(cfg: Config) -> None:
     connector = aiohttp.TCPConnector(limit=max(100, cfg.concurrency * 2))
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            asyncio.create_task(process_one(i, row, session, cfg, semaphore))
-            for i, row in enumerate(rows)
-        ]
+        indexed_rows = list(enumerate(rows))
+        batches = chunk_list(indexed_rows, cfg.batch_size)
+        tasks = [asyncio.create_task(process_batch(batch, session, cfg, semaphore)) for batch in batches]
 
         async with aiofiles.open(cfg.output_path, "w", encoding="utf-8") as writer:
-            for fut in tqdm_asyncio.as_completed(tasks, total=len(tasks), desc="Stage1 CDT"):
-                item = await fut
-                await writer.write(json.dumps(item, ensure_ascii=False) + "\n")
+            for fut in tqdm_asyncio.as_completed(tasks, total=len(tasks), desc="Stage1 CDT(Batch)"):
+                items = await fut
+                for item in items:
+                    await writer.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def main() -> None:
@@ -221,6 +285,8 @@ def main() -> None:
         max_retries=max(1, args.max_retries),
         retry_base_delay=max(0.1, args.retry_base_delay),
         max_tokens=max(32, args.max_tokens),
+        batch_size=max(1, args.batch_size),
+        max_chars_per_field=max(50, args.max_chars_per_field),
     )
     if not cfg.api_key:
         raise ValueError("Missing API key. Set --api-key or DEEPSEEK_API_KEY/OPENAI_API_KEY.")
