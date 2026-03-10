@@ -1,9 +1,27 @@
-<!-- - 数据集tag
+- 你好，我正在实现一项关于大语言模型数据配方（Data Recipe）的科研项目。请帮我用 Python在4.1中编写“阶段一：数据加载与 CDT 能力蒸馏”的完整脚本。核心任务：遍历 data/alpaca-gpt4-data-en/train.jsonl 数据集（支持传入参数限制处理数量，例如先跑前 1000 条测试），使用异步 API 调用大语言模型（如 deepseek API），为每一条数据生成高密度的能力描述。LLM 的 System Prompt 与输出要求：构造 Prompt 让 LLM 阅读单条数据的 instruction, input, output 后，输出一段英文的高密度文本（CDT_description，约 30-50 词）。这段文本必须剥离具体实体，严格围绕以下三个正交维度进行高度抽象概括：Cognition (认知)：例如逻辑推理、信息抽取、创造性写作。Domain (领域)：例如计算机科学、基础物理、日常闲聊。Task (任务)：例如代码除错、文本摘要。数据持久化：将原始数据字段以及生成的 CDT_description 组合成新的 JSON 对象，逐行异步写入本地的 alpaca_cdt_profile.jsonl 文件。工程与环境要求：运行环境：Ubuntu，Python 3。并发控制：必须使用 asyncio 和 aiohttp 实现高并发调用，利用 asyncio.Semaphore 严格控制并发数（防止 Rate Limit），并带有指数退避的重试机制。可视化：使用 tqdm.asyncio 在终端显示处理进度条。
+
+
+
+
+- export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
+python src/4.1/stage1_atomic_profile.py \
+  --input data/alpaca-gpt4-data-en/train.jsonl \
+  --output data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
+  --max-samples 1000 \
+  --concurrency 32 \
+  --model deepseek-chat \
+  --base-url https://api.deepseek.com
+
+- 非常好。现在我们需要在4.1实现“阶段二：基于密度与分离度的目标函数计算引擎”。核心任务：编写一个 Python 模块，包含用于计算聚类状态的评估函数。该评价体系由“簇内密度”和“簇间分离度”组成，不需要任何平衡系数。数学公式与要求（请严格使用 PyTorch 或 Numpy 实现矩阵运算）：给定一个簇的集合 $\mathcal{C} = \{C_1, C_2, \dots, C_k\}$，每个簇包含若干稠密特征向量。簇内密度 (Density)：计算公式为该簇内所有向量到簇心 $c_k$ 的欧氏距离之和，除以最大距离（防除零）。$$Dens(C_k) = \frac{\sum_{x \in C_k} ||x - c_k||}{\max_{x \in C_k} ||x - c_k|| + 1e-5}$$簇间分离度 (Separation)：计算公式为该簇心到其他所有簇心的平均欧氏距离。如果当前系统只有一个簇，则分离度定义为 0。$$Sep(C_k) = \frac{1}{|\mathcal{C}| - 1} \sum_{j \neq k} ||c_k - c_j||$$全局目标函数 ($\mathcal{J}$)：所有簇的密度与分离度乘积的总和。$$\mathcal{J}(\mathcal{C}) = \sum_{C_k \in \mathcal{C}} \left( Dens(C_k) \times Sep(C_k) \right)$$代码结构要求：请封装一个 ObjectiveEvaluator 类，接收包含多个簇向量的列表，返回全局 $\mathcal{J}$ 值。请特别注意处理极端边界情况（例如某个簇只有一个元素时，$\max$ 距离为 0 的处理；全局只有一个簇时 $\mathcal{J}=0$ 的处理）。
+
+- 在4.1实现“阶段三：基于 $\mathcal{J}$ 目标函数的多路径增量层次聚类树 (Overlapping Incremental Hierarchical Clustering)”。核心数据结构设计：请实现一个 CapabilityNode 类（树节点），包含以下属性：node_id: 唯一标识符。center: 簇中心特征向量。data_ids: 属于该节点的数据 ID 列表。children: 子节点列表（List of CapabilityNode）。level: 当前节点所在的层级（Root 为 0）。算法执行逻辑 (从 Root 开始逐条插入 $v_i$)：编写一个递归的 insert(node, v_i, data_id) 方法。当数据 $v_i$ 到达某个 node 时：Step 1: 软分配路由 (Soft Routing)如果 node 没有 children（即为叶子节点），则将 $v_i$ 暂存入该节点。如果 node 有 children，计算 $v_i$ 到所有子节点中心的距离。选出距离小于某个动态阈值（例如该子节点内部最大半径 $D$）的所有子节点（或者选 Top-2）。将 $v_i$ 递归调用 insert 压入这些符合条件的子节点中（实现一条数据属于多个簇的重叠属性）。Step 2: 基于 $\mathcal{J}$ 的同层拓扑演化 (Topology Evolution)在 $v_i$ 压入后，我们需要检查当前 node 的子节点层级（node.children）是否需要演化。使用之前写好的 ObjectiveEvaluator（计算密度与分离度乘积的和）计算当前的 $\mathcal{J}_{current}$。构造假想状态：状态 A (维持现状)：$\mathcal{J}_{absorb} = \mathcal{J}_{current}$。状态 B (分裂/新建分支)：如果刚才被压入的子节点内部变得非常拥挤，尝试将其内部的数据使用 K-Means(K=2) 打碎，变成当前 node 的两个新子节点。计算 $\mathcal{J}_{split}$。状态 C (合并冗余)：寻找当前 node.children 中中心距离最近的两个子节点，将它们合并为一个。计算 $\mathcal{J}_{merge}$。Step 3: 贪心决策取 $\mathcal{J}_{absorb}, \mathcal{J}_{split}, \mathcal{J}_{merge}$ 的最大值。执行对应的拓扑变换，并更新受影响节点的中心向量。工程要求：算法初始化时，创建一个空的 Root 节点。顺序流式（Streaming）读取 alpaca_cdt_profile.jsonl，提取稠密向量并调用 Root.insert()。请使用 logging 打印一棵 ASCII 风格的能力树（Tree print），在每处理 100 条数据后，展示当前树的深度、每一层的节点数，以及全局 $\mathcal{J}$ 值，以证明层次结构正在动态生长。代码请加满详尽的中文注释，确保数学公式与树状数据结构的逻辑清晰解耦。
+
+<!-- <!-- <!-- <!-- - 数据集tag
 ```
 OPENAI_API_KEY='sk-ab412f420cd540888da4732a35600c4a' OPENAI_BASE_URL='https://api.deepseek.com/v1' python src/4.1/stage1_atomic_profile.py   --model deepseek-chat   --max-samples 1000   --batch-size 8   --concurrency 10   --max-tokens 700   --output data/alpaca_with_tags.jsonl
 ```
 - 初始层次聚类
-python src/4.1/stage2_vectorize_cluster.py   --input-jsonl data/alpaca-gpt4-data-en/alpaca_with_tags_first1000.jsonl   --output-jsonl data/alpaca-gpt4-data-en/alpaca_with_initial_clusters.jsonl   --output-mapping-json data/alpaca-gpt4-data-en/sample_to_initial_clusters.json   --output-tag-cluster-json data/alpaca-gpt4-data-en/tag_to_cluster.json   --distance-threshold 0.7   --embedding-batch-size 256 -->
+python src/4.1/stage2_vectorize_cluster.py   --input-jsonl data/alpaca-gpt4-data-en/alpaca_with_tags_first1000.jsonl   --output-jsonl data/alpaca-gpt4-data-en/alpaca_with_initial_clusters.jsonl   --output-mapping-json data/alpaca-gpt4-data-en/sample_to_initial_clusters.json   --output-tag-cluster-json data/alpaca-gpt4-data-en/tag_to_cluster.json   --distance-threshold 0.7   --embedding-batch-size 256 
 - 数据集tag+description
 ```
 OPENAI_API_KEY='sk-ab412f420cd540888da4732a35600c4a' \
@@ -40,4 +58,5 @@ python src/4.1/stage3_dynamic_capability_space.py \
 
 ```
 你好，我正在为一篇大模型数据配方论文编写 Baseline（基线）实验代码。请帮我用 Python 实现一个“基于原始文本 Embedding 与轮廓系数峰值搜索 (Silhouette Peak Search) 的最优 K-Means 聚类采样”脚本。核心任务：对 alpaca 数据集（本地alpaca_1000.JSONL 文件）的原始文本进行向量化。然后，实现一个带早停机制（Early Stopping）的动态搜索算法，寻找轮廓系数的“峰值（拐点）”以确定最佳的 $k$ 值。最后，使用该最佳 $k$ 值进行聚类，并从各簇中均匀采样。具体流程要求：数据准备与拼接：加载数据集，将 instruction, input, 和 output 拼接成完整的纯文本字符串。向量化 (Embedding)：使用 sentence-transformers 将纯文本转化为稠密向量（支持 GPU 加速）。动态寻找最优 $k$ 值 (Dynamic Optimal K Search via Silhouette Peak)：设定一个初始 $k$ 值（如 start_k=10）和搜索步长（如 step=10）。在一个 while 循环中递增 $k$，执行 K-Means 聚类，并使用 sklearn.metrics.silhouette_score（开启 sample_size=10000 参数以加速计算）计算当前的轮廓系数。峰值检测与早停逻辑：维护一个历史最高轮廓系数 best_score 和对应的 best_k。设定一个容忍度参数（如 patience=3）。如果在连续 patience 个步长内，新计算的轮廓系数都低于当前的 best_score，则判定已经越过“峰值”。此时立即终止搜索（break），并输出找到的 best_k。均匀采样 (Uniform Sampling)：接收采样比例参数（如 sample_ratio=0.1）。重新使用 best_k 对全量数据跑一次 K-Means 拿到最终标签，按比例从每个簇中随机无放回抽取样本。数据持久化：将采样得到的数据保存为标准 JSONL 文件（如 alpaca_kmeans_peak_baseline.jsonl）。工程与环境要求：运行环境：Ubuntu，Python 3。监控与日志：使用 logging 模块详细打印每一次搜索的 $k$ 值及其轮廓系数，并在触发早停时打印提示信息（例如 "Peak detected at k=..., stopping search"）。代码结构：请提供高内聚、低耦合的规范代码，包含详细的注释。
-```
+``` -->
+- 
