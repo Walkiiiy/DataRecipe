@@ -3,7 +3,7 @@
 Features:
 - Load `tatsu-lab/alpaca` with HuggingFace `datasets`
 - Support quick testing via `--max-samples` (default: 1000)
-- Extract rich zero-shot capability tags for each sample
+- Extract rich zero-shot tags and `T_description` for each sample
 - Asynchronous concurrent batched API calls with retries/backoff
 - Progress bar and JSONL persistence
 
@@ -12,7 +12,7 @@ Example:
     python src/4.1/stage1_atomic_profile.py \
         --model gpt-4o-mini \
         --max-samples 1000 \
-        --output data/alpaca_with_tags.jsonl
+        --output data/alpaca_capability_profile.jsonl
 """
 
 from __future__ import annotations
@@ -34,10 +34,15 @@ from tqdm import tqdm
 
 SYSTEM_PROMPT = (
     "You are an expert at instruction-data capability profiling. "
-    "Your task is to produce rich, fine-grained capability tags for one instruction sample. "
-    "Return MANY tags when appropriate; do not restrict to 3 tags. "
-    "The tags must jointly reflect both COMMON abilities and DISTINCTIVE/SPECIAL traits of this sample. "
-    "Output format: one comma-separated line of tags only.\n\n"
+    "Your task is to produce a structured capability profile for each instruction sample.\n\n"
+    "For each sample, generate:\n"
+    "1) tags: many fine-grained capability tags (comma-separated string), capturing both common and distinctive traits.\n"
+    "2) T_description: one dense, de-redundant English paragraph of about 30-50 words.\n"
+    "   T_description must abstract strictly from three orthogonal dimensions:\n"
+    "   - Cognition (how to think/process)\n"
+    "   - Domain (what knowledge area/topic)\n"
+    "   - Task (what action/output objective)\n"
+    "   Remove concrete named entities and avoid filler text.\n\n"
     "Tagging principles:\n"
     "1) Cover common/general capabilities:\n"
     "   - task family (e.g., QA, Summarization, Translation, Coding, Classification)\n"
@@ -54,7 +59,8 @@ SYSTEM_PROMPT = (
     "4) Use English tags in PascalCase or concise CamelCase.\n"
     "5) Remove duplicates and near-duplicates.\n"
     "6) Typically return 8-20 tags when the sample is information-rich; fewer only if truly simple.\n"
-    "7) Do not output any explanation, JSON, numbering, or extra commentary."
+    "7) Output must be machine-parseable JSON when requested by the user prompt.\n"
+    "8) No extra commentary."
 )
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -110,10 +116,10 @@ class OpenAICompatibleClient:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Stage 1: Atomic profile tag generation")
+    parser = argparse.ArgumentParser(description="Stage 1: Capability profile generation")
     parser.add_argument("--dataset-name", type=str, default="tatsu-lab/alpaca")
     parser.add_argument("--split", type=str, default="train")
-    parser.add_argument("--output", type=str, default="data/alpaca_with_tags.jsonl")
+    parser.add_argument("--output", type=str, default="data/alpaca_capability_profile.jsonl")
     parser.add_argument(
         "--max-samples",
         type=int,
@@ -157,6 +163,21 @@ def normalize_tags(raw: str) -> str:
     return ", ".join(uniq) if uniq else "General"
 
 
+def normalize_description(raw: str) -> str:
+    text = " ".join(str(raw).strip().split())
+    text = re.sub(r"^T_description\s*:\s*", "", text, flags=re.IGNORECASE)
+    words = text.split()
+    if len(words) > 50:
+        text = " ".join(words[:50])
+    if not text:
+        return (
+            "Cognition: generic instruction following and structured response planning. "
+            "Domain: broad open-domain knowledge context. "
+            "Task: generate an aligned response under the requested format and constraints."
+        )
+    return text
+
+
 def strip_code_fence(text: str) -> str:
     cleaned = text.strip()
     if cleaned.startswith("```"):
@@ -171,13 +192,13 @@ def truncate_text(text: str, max_chars: int = 800) -> str:
     return text[: max_chars - 3] + "..."
 
 
-def parse_batch_tags(raw: str, expected_ids: list[int]) -> dict[int, str]:
+def parse_batch_profiles(raw: str, expected_ids: list[int]) -> dict[int, dict[str, str]]:
     cleaned = strip_code_fence(raw)
     data = json.loads(cleaned)
     if not isinstance(data, dict):
         raise ValueError("Batch response is not a JSON object.")
 
-    out: dict[int, str] = {}
+    out: dict[int, dict[str, str]] = {}
     for sid in expected_ids:
         val = data.get(str(sid))
         if val is None:
@@ -186,30 +207,44 @@ def parse_batch_tags(raw: str, expected_ids: list[int]) -> dict[int, str]:
         if val is None:
             continue
 
-        if isinstance(val, list):
-            merged = ", ".join(str(x).strip() for x in val if str(x).strip())
+        if isinstance(val, dict):
+            tags_raw = val.get("tags", "")
+            desc_raw = val.get("T_description", "")
         else:
-            merged = str(val).strip()
-        out[sid] = normalize_tags(merged)
+            # Backward-compatible fallback.
+            tags_raw = val
+            desc_raw = ""
+
+        if isinstance(tags_raw, list):
+            tags_text = ", ".join(str(x).strip() for x in tags_raw if str(x).strip())
+        else:
+            tags_text = str(tags_raw).strip()
+
+        out[sid] = {
+            "tags": normalize_tags(tags_text),
+            "T_description": normalize_description(desc_raw),
+        }
     return out
 
 
-async def extract_tags(
+async def extract_profile(
     instruction: str,
     input_text: str,
     output_text: str,
     client: OpenAICompatibleClient,
     session: aiohttp.ClientSession,
     cfg: Config,
-) -> str:
-    """Extract rich capability tags from one sample with retry/backoff."""
+) -> dict[str, str]:
+    """Extract capability profile from one sample with retry/backoff."""
     user_prompt = (
         "Instruction sample:\n"
         f"Instruction: {instruction}\n"
         f"Input: {input_text}\n"
         f"Output: {output_text}\n\n"
-        "Return only capability tags as a comma-separated list. "
-        "Include both common and distinctive tags; prefer rich coverage."
+        "Return STRICT JSON only with keys `tags` and `T_description`.\n"
+        "Example: {\"tags\":\"TagA, TagB\", \"T_description\":\"...\"}\n"
+        "For T_description, use about 30-50 words and explicitly cover Cognition, Domain, Task "
+        "without concrete named entities."
     )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -219,17 +254,29 @@ async def extract_tags(
     for attempt in range(1, cfg.max_retries + 1):
         try:
             raw = await client.chat_completion(session=session, messages=messages)
-            return normalize_tags(raw)
+            cleaned = strip_code_fence(raw)
+            data = json.loads(cleaned)
+            return {
+                "tags": normalize_tags(data.get("tags", "")),
+                "T_description": normalize_description(data.get("T_description", "")),
+            }
         except Exception as exc:  # noqa: BLE001
             if attempt == cfg.max_retries:
-                logging.error("Tag extraction failed after retries: %s", exc)
-                return "General"
+                logging.error("Profile extraction failed after retries: %s", exc)
+                return {
+                    "tags": "General",
+                    "T_description": (
+                        "Cognition: generic instruction following and basic transformation. "
+                        "Domain: broad open-domain content without specialized grounding. "
+                        "Task: produce a direct response aligned with user intent and requested format."
+                    ),
+                }
 
             backoff = cfg.retry_base_delay * (2 ** (attempt - 1))
             jitter = random.uniform(0, 0.3 * backoff)
             sleep_s = backoff + jitter
             logging.warning(
-                "extract_tags retry %s/%s due to error: %s; sleep %.2fs",
+                "extract_profile retry %s/%s due to error: %s; sleep %.2fs",
                 attempt,
                 cfg.max_retries,
                 exc,
@@ -237,15 +284,22 @@ async def extract_tags(
             )
             await asyncio.sleep(sleep_s)
 
-    return "General"
+    return {
+        "tags": "General",
+        "T_description": (
+            "Cognition: generic instruction following and basic transformation. "
+            "Domain: broad open-domain content without specialized grounding. "
+            "Task: produce a direct response aligned with user intent and requested format."
+        ),
+    }
 
 
-async def extract_tags_batch(
+async def extract_profiles_batch(
     batch_items: list[tuple[int, dict[str, Any]]],
     client: OpenAICompatibleClient,
     session: aiohttp.ClientSession,
     cfg: Config,
-) -> dict[int, str]:
+) -> dict[int, dict[str, str]]:
     expected_ids = [idx for idx, _ in batch_items]
     lines: list[str] = []
     for idx, row in batch_items:
@@ -260,8 +314,9 @@ async def extract_tags_batch(
         )
 
     user_prompt = (
-        "You will label multiple instruction samples.\n"
-        "Return STRICT JSON only: an object mapping sample ID(string) -> comma-separated tags string.\n"
+        "You will profile multiple instruction samples.\n"
+        "Return STRICT JSON only: an object mapping sample ID(string) -> "
+        "{\"tags\": \"comma-separated tags\", \"T_description\": \"30-50 words\"}.\n"
         "No markdown, no explanation.\n"
         f"Sample IDs: {expected_ids}\n\n"
         "Samples:\n"
@@ -275,7 +330,7 @@ async def extract_tags_batch(
     for attempt in range(1, cfg.max_retries + 1):
         try:
             raw = await client.chat_completion(session=session, messages=messages)
-            parsed = parse_batch_tags(raw, expected_ids)
+            parsed = parse_batch_profiles(raw, expected_ids)
             if not parsed:
                 raise ValueError("Parsed empty batch response.")
             return parsed
@@ -287,7 +342,7 @@ async def extract_tags_batch(
             jitter = random.uniform(0, 0.3 * backoff)
             sleep_s = backoff + jitter
             logging.warning(
-                "extract_tags_batch retry %s/%s due to error: %s; sleep %.2fs",
+                "extract_profiles_batch retry %s/%s due to error: %s; sleep %.2fs",
                 attempt,
                 cfg.max_retries,
                 exc,
@@ -310,19 +365,26 @@ async def process_batch(
     cfg: Config,
 ) -> list[tuple[int, dict[str, Any]]]:
     async with semaphore:
-        batch_tags = await extract_tags_batch(batch_items, client, session, cfg)
+        batch_profiles = await extract_profiles_batch(batch_items, client, session, cfg)
 
         # Fallback to single-sample extraction when some IDs are missing.
         results: list[tuple[int, dict[str, Any]]] = []
         for idx, row in batch_items:
-            tags = batch_tags.get(idx)
-            if tags is None:
+            profile = batch_profiles.get(idx)
+            if profile is None:
                 instruction = str(row.get("instruction", ""))
                 input_text = str(row.get("input", ""))
                 output_text = str(row.get("output", ""))
-                tags = await extract_tags(instruction, input_text, output_text, client, session, cfg)
-            out = dict(row)
-            out["tags"] = tags
+                profile = await extract_profile(instruction, input_text, output_text, client, session, cfg)
+
+            # Persist only required fields from raw sample + generated profile.
+            out = {
+                "instruction": row.get("instruction", ""),
+                "input": row.get("input", ""),
+                "output": row.get("output", ""),
+                "tags": profile.get("tags", "General"),
+                "T_description": profile.get("T_description", ""),
+            }
             results.append((idx, out))
         return results
 
@@ -356,7 +418,7 @@ async def run_pipeline(cfg: Config) -> None:
         ]
 
         results: list[dict[str, Any] | None] = [None] * total
-        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Tagging(Batches)"):
+        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Profiling(Batches)"):
             batch_result = await fut
             for idx, tagged_row in batch_result:
                 results[idx] = tagged_row
@@ -367,7 +429,7 @@ async def run_pipeline(cfg: Config) -> None:
                 continue
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    logging.info("Saved tagged dataset to: %s", cfg.output.resolve())
+    logging.info("Saved capability profile dataset to: %s", cfg.output.resolve())
 
 
 def main() -> None:
