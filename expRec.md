@@ -20,4 +20,4 @@ python src/4.1/stage1_atomic_profile.py \
 
 - 目前的版本没有动态添加数据到能力锚点集直到锚点集稳定的功能
 - - 初始层次聚类
-python src/4.1/stage2_vectorize_cluster.py   --input-jsonl data/alpaca-gpt4-data-en/alpaca_with_tags_first1000.jsonl   --output-jsonl data/alpaca-gpt4-data-en/alpaca_with_initial_clusters.jsonl   --output-mapping-json data/alpaca-gpt4-data-en/sample_to_initial_clusters.json   --output-tag-cluster-json data/alpaca-gpt4-data-en/tag_to_cluster.json   --distance-threshold 0.7   --embedding-batch-size 256 
+python src/4.1/stage2_vectorize_cluster.py   --input-jsonl data/alpaca-gpt4-data-en/alpaca_capability_profile.jsonl   --output-jsonl data/alpaca-gpt4-data-en/alpaca_with_initial_clusters.jsonl   --output-mapping-json data/alpaca-gpt4-data-en/sample_to_initial_clusters.json   --output-tag-cluster-json data/alpaca-gpt4-data-en/tag_to_cluster.json   --distance-threshold 0.7   --embedding-batch-size 256 
