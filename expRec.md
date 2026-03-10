@@ -16,13 +16,22 @@ python src/4.1/stage1_atomic_profile.py \
 
 - 在4.1实现“阶段三：基于 $\mathcal{J}$ 目标函数的多路径增量层次聚类树 (Overlapping Incremental Hierarchical Clustering)”。核心数据结构设计：请实现一个 CapabilityNode 类（树节点），包含以下属性：node_id: 唯一标识符。center: 簇中心特征向量。data_ids: 属于该节点的数据 ID 列表。children: 子节点列表（List of CapabilityNode）。level: 当前节点所在的层级（Root 为 0）。算法执行逻辑 (从 Root 开始逐条插入 $v_i$)：编写一个递归的 insert(node, v_i, data_id) 方法。当数据 $v_i$ 到达某个 node 时：Step 1: 软分配路由 (Soft Routing)如果 node 没有 children（即为叶子节点），则将 $v_i$ 暂存入该节点。如果 node 有 children，计算 $v_i$ 到所有子节点中心的距离。选出距离小于某个动态阈值（例如该子节点内部最大半径 $D$）的所有子节点（或者选 Top-2）。将 $v_i$ 递归调用 insert 压入这些符合条件的子节点中（实现一条数据属于多个簇的重叠属性）。Step 2: 基于 $\mathcal{J}$ 的同层拓扑演化 (Topology Evolution)在 $v_i$ 压入后，我们需要检查当前 node 的子节点层级（node.children）是否需要演化。使用之前写好的 ObjectiveEvaluator（计算密度与分离度乘积的和）计算当前的 $\mathcal{J}_{current}$。构造假想状态：状态 A (维持现状)：$\mathcal{J}_{absorb} = \mathcal{J}_{current}$。状态 B (分裂/新建分支)：如果刚才被压入的子节点内部变得非常拥挤，尝试将其内部的数据使用 K-Means(K=2) 打碎，变成当前 node 的两个新子节点。计算 $\mathcal{J}_{split}$。状态 C (合并冗余)：寻找当前 node.children 中中心距离最近的两个子节点，将它们合并为一个。计算 $\mathcal{J}_{merge}$。Step 3: 贪心决策取 $\mathcal{J}_{absorb}, \mathcal{J}_{split}, \mathcal{J}_{merge}$ 的最大值。执行对应的拓扑变换，并更新受影响节点的中心向量。工程要求：算法初始化时，创建一个空的 Root 节点。顺序流式（Streaming）读取 alpaca_cdt_profile.jsonl，提取稠密向量并调用 Root.insert()。请使用 logging 打印一棵 ASCII 风格的能力树（Tree print），在每处理 100 条数据后，展示当前树的深度、每一层的节点数，以及全局 $\mathcal{J}$ 值，以证明层次结构正在动态生长。代码请加满详尽的中文注释，确保数学公式与树状数据结构的逻辑清晰解耦。
 
-- python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+<!-- - python src/4.1/stage3_overlapping_incremental_hierarchy.py \
   --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
   --max-samples 1000 \
   --log-every 100 \
   --route-top-k 2 \
   --split-min-size 8 \
-  --split-density-threshold 3.0
+  --split-density-threshold 3.0 -->
+no children 修复
+- python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
+  --max-samples 1000 \
+  --log-every 100 \
+  --split-min-size 8 \
+  --split-density-threshold 1.5 \
+  --route-top-k 2 \
+  --log-level INFO
 
 <!-- <!-- <!-- <!-- - 数据集tag
 ```

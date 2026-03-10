@@ -226,7 +226,8 @@ class OverlappingIncrementalHierarchy:
             # 随机选两个不同样本作为初始中心
             seeds = self.rng.choice(n, size=2, replace=False)
             c0, c1 = mat[seeds[0]].copy(), mat[seeds[1]].copy()
-            assign = np.zeros(n, dtype=np.int64)
+            # 使用 -1 作为未初始化标签，避免首轮“全 0”时被误判收敛。
+            assign = np.full(n, -1, dtype=np.int64)
 
             for _iter in range(20):
                 d0 = np.linalg.norm(mat - c0.reshape(1, -1), axis=1)
@@ -256,6 +257,24 @@ class OverlappingIncrementalHierarchy:
             return None
         return np.where(best_assign == 0)[0], np.where(best_assign == 1)[0]
 
+    def _median_bisect(self, mat: np.ndarray) -> tuple[np.ndarray, np.ndarray] | None:
+        """KMeans 失败时的稳健兜底：按主方向投影后以中位数一刀切分。"""
+        n = mat.shape[0]
+        if n < 2:
+            return None
+
+        centered = mat - mat.mean(axis=0, keepdims=True)
+        # 取方差最大的维度作为近似主方向，避免 SVD 额外开销。
+        axis = int(np.argmax(np.var(centered, axis=0)))
+        proj = centered[:, axis]
+        order = np.argsort(proj)
+        mid = n // 2
+        idx0 = order[:mid]
+        idx1 = order[mid:]
+        if len(idx0) == 0 or len(idx1) == 0:
+            return None
+        return idx0, idx1
+
     def _simulate_split(
         self,
         node: CapabilityNode,
@@ -271,6 +290,8 @@ class OverlappingIncrementalHierarchy:
             return None
 
         split_idx = self._two_means(mat, trials=self.cfg.split_trials)
+        if split_idx is None:
+            split_idx = self._median_bisect(mat)
         if split_idx is None:
             return None
 
@@ -335,6 +356,14 @@ class OverlappingIncrementalHierarchy:
 
         split_idx = self._two_means(mat, trials=self.cfg.split_trials)
         if split_idx is None:
+            split_idx = self._median_bisect(mat)
+        if split_idx is None:
+            logging.debug(
+                "Leaf split skipped at %s: split failed (size=%d, density=%.6f).",
+                node.node_id,
+                len(node.data_ids),
+                density,
+            )
             return
         idx0, idx1 = split_idx
         ids0 = [node.data_ids[i] for i in idx0.tolist()]
