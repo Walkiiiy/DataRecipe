@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import logging
 from dataclasses import dataclass
@@ -33,12 +34,6 @@ try:
     from modelscope import snapshot_download
 except Exception:  # noqa: BLE001
     snapshot_download = None
-
-try:
-    # 新版 trl 推荐使用 SFTConfig
-    from trl import SFTConfig
-except Exception:  # noqa: BLE001
-    SFTConfig = None
 
 
 @dataclass
@@ -160,29 +155,53 @@ def resolve_model_path(base_model: str, model_source: str, cache_dir: Path | Non
 
 
 def build_training_args(cfg: TrainConfig) -> TrainingArguments:
-    return TrainingArguments(
-        output_dir=str(cfg.output_dir),
-        learning_rate=cfg.learning_rate,
-        per_device_train_batch_size=cfg.train_batch_size,
-        per_device_eval_batch_size=cfg.eval_batch_size,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,
-        num_train_epochs=cfg.num_train_epochs,
-        weight_decay=cfg.weight_decay,
-        warmup_ratio=cfg.warmup_ratio,
-        logging_steps=cfg.logging_steps,
-        eval_steps=cfg.eval_steps,
-        save_steps=cfg.save_steps,
-        evaluation_strategy="steps",
-        save_strategy="steps",
-        logging_strategy="steps",
-        report_to=[],
-        fp16=(get_dtype() == torch.float16),
-        bf16=(get_dtype() == torch.bfloat16),
-        gradient_checkpointing=True,
-        seed=cfg.seed,
-        data_seed=cfg.seed,
-        load_best_model_at_end=False,
-    )
+    kwargs: dict[str, Any] = {
+        "output_dir": str(cfg.output_dir),
+        "learning_rate": cfg.learning_rate,
+        "per_device_train_batch_size": cfg.train_batch_size,
+        "per_device_eval_batch_size": cfg.eval_batch_size,
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+        "num_train_epochs": cfg.num_train_epochs,
+        "weight_decay": cfg.weight_decay,
+        "warmup_ratio": cfg.warmup_ratio,
+        "logging_steps": cfg.logging_steps,
+        "eval_steps": cfg.eval_steps,
+        "save_steps": cfg.save_steps,
+        "save_strategy": "steps",
+        "logging_strategy": "steps",
+        "report_to": [],
+        "fp16": (get_dtype() == torch.float16),
+        "bf16": (get_dtype() == torch.bfloat16),
+        "gradient_checkpointing": True,
+        "seed": cfg.seed,
+        "data_seed": cfg.seed,
+        "load_best_model_at_end": False,
+    }
+    # 兼容不同 transformers 版本：evaluation_strategy / eval_strategy
+    sig = inspect.signature(TrainingArguments.__init__)
+    if "evaluation_strategy" in sig.parameters:
+        kwargs["evaluation_strategy"] = "steps"
+    elif "eval_strategy" in sig.parameters:
+        kwargs["eval_strategy"] = "steps"
+    else:
+        raise RuntimeError("Neither `evaluation_strategy` nor `eval_strategy` exists in TrainingArguments.")
+    return TrainingArguments(**kwargs)
+
+
+def load_causal_lm(model_path: str, dtype: torch.dtype):
+    """兼容不同 transformers 版本：优先 dtype，回退 torch_dtype。"""
+    try:
+        return AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            dtype=dtype,
+        )
+    except TypeError:
+        return AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            torch_dtype=dtype,
+        )
 
 
 class EvalLossCallback(TrainerCallback):
@@ -265,11 +284,7 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        trust_remote_code=True,
-        torch_dtype=get_dtype(),
-    )
+    model = load_causal_lm(model_path, get_dtype())
 
     peft_cfg = LoraConfig(
         r=cfg.lora_r,
@@ -282,55 +297,18 @@ def main() -> None:
 
     train_args = build_training_args(cfg)
 
-    # trl 在不同版本对配置对象支持略有差异：优先 SFTConfig，不可用则回退 TrainingArguments。
-    if SFTConfig is not None:
-        sft_args = SFTConfig(
-            output_dir=train_args.output_dir,
-            learning_rate=train_args.learning_rate,
-            per_device_train_batch_size=train_args.per_device_train_batch_size,
-            per_device_eval_batch_size=train_args.per_device_eval_batch_size,
-            gradient_accumulation_steps=train_args.gradient_accumulation_steps,
-            num_train_epochs=train_args.num_train_epochs,
-            weight_decay=train_args.weight_decay,
-            warmup_ratio=train_args.warmup_ratio,
-            logging_steps=train_args.logging_steps,
-            eval_steps=train_args.eval_steps,
-            save_steps=train_args.save_steps,
-            evaluation_strategy=train_args.evaluation_strategy,
-            save_strategy=train_args.save_strategy,
-            logging_strategy=train_args.logging_strategy,
-            report_to=train_args.report_to,
-            fp16=train_args.fp16,
-            bf16=train_args.bf16,
-            gradient_checkpointing=train_args.gradient_checkpointing,
-            seed=train_args.seed,
-            data_seed=train_args.data_seed,
-            max_seq_length=cfg.max_seq_length,
-            packing=False,
-        )
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=train_ds,
-            eval_dataset=eval_ds,
-            peft_config=peft_cfg,
-            args=sft_args,
-            dataset_text_field="text",
-            callbacks=[EvalLossCallback()],
-        )
-    else:
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=train_ds,
-            eval_dataset=eval_ds,
-            peft_config=peft_cfg,
-            args=train_args,
-            dataset_text_field="text",
-            max_seq_length=cfg.max_seq_length,
-            packing=False,
-            callbacks=[EvalLossCallback()],
-        )
+    trainer = SFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+        peft_config=peft_cfg,
+        args=train_args,
+        dataset_text_field="text",
+        max_seq_length=cfg.max_seq_length,
+        packing=False,
+        callbacks=[EvalLossCallback()],
+    )
 
     trainer.train()
     final_metrics = trainer.evaluate()
