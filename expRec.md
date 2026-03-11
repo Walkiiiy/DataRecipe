@@ -42,6 +42,17 @@ no children 修复
   --d-max 0.35 \
   --log-level INFO
 
+
+- 给我把原来的log-every功能加上，并且加入一个参数，当连续几步都没有新节点被新建时，能力空间构建完毕，就收敛结束，并且把最后结果保存下来。
+
+- python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
+  --max-samples 1000 \
+  --d-max 0.35 \
+  --log-every 100 \
+  --patience-no-new-node 80 \
+  --log-level INFO
+
 <!-- <!-- <!-- <!-- - 数据集tag
 ```
 OPENAI_API_KEY='sk-ab412f420cd540888da4732a35600c4a' OPENAI_BASE_URL='https://api.deepseek.com/v1' python src/4.1/stage1_atomic_profile.py   --model deepseek-chat   --max-samples 1000   --batch-size 8   --concurrency 10   --max-tokens 700   --output data/alpaca_with_tags.jsonl

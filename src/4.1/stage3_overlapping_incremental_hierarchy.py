@@ -56,11 +56,15 @@ class CapabilityNode:
 @dataclass
 class Config:
     input_jsonl: Path
+    output_tree_json: Path
+    output_summary_json: Path
     embedding_model: str
     device: str
     max_samples: int | None
     d_max: float
     epsilon: float
+    log_every: int
+    patience_no_new_node: int
     log_level: str
 
 
@@ -241,16 +245,57 @@ class IncrementalHierarchicalTree:
         node.children[nearest_idx] = p_new
         self._refresh_center_upward(path)
 
-    def insert_one(self, data_id: str, text: str) -> None:
+    def insert_one(self, data_id: str, text: str) -> int:
+        before = self.node_seq
         vec = self.vectorizer.encode_one(text)
         self.vector_store[data_id] = vec
         self.insert(self.root, vec, data_id, path=[self.root])
+        # 返回本次插入引入的新节点数量，供收敛判定使用
+        return self.node_seq - before
 
     # -----------------------------
     # 打印与统计
     # -----------------------------
     def _subtree_size(self, node: CapabilityNode) -> int:
         return len(self._get_subtree_ids(node))
+
+    def _iter_nodes(self, node: CapabilityNode | None = None) -> list[CapabilityNode]:
+        if node is None:
+            node = self.root
+        out: list[CapabilityNode] = [node]
+        for child in node.children:
+            out.extend(self._iter_nodes(child))
+        return out
+
+    def depth(self) -> int:
+        def _depth(n: CapabilityNode) -> int:
+            if not n.children:
+                return 0
+            return 1 + max(_depth(c) for c in n.children)
+
+        return _depth(self.root)
+
+    def level_counts(self) -> dict[int, int]:
+        counts: dict[int, int] = {}
+
+        def _walk(n: CapabilityNode, lv: int) -> None:
+            counts[lv] = counts.get(lv, 0) + 1
+            for c in n.children:
+                _walk(c, lv + 1)
+
+        _walk(self.root, 0)
+        return dict(sorted(counts.items(), key=lambda kv: kv[0]))
+
+    def global_j(self) -> float:
+        # 全局用“叶子集合”作为最终簇集合
+        leaves = [n for n in self._iter_nodes(self.root) if n.is_leaf and n.data_ids]
+        if len(leaves) <= 1:
+            return 0.0
+        clusters = []
+        for leaf in leaves:
+            mat = np.stack([self.vector_store[i] for i in leaf.data_ids], axis=0)
+            clusters.append(mat)
+        return self.objective.evaluate(clusters)
 
     def print_tree(self, node: CapabilityNode | None = None, prefix: str = "", is_last: bool = True) -> None:
         """ASCII 树打印。"""
@@ -276,6 +321,19 @@ class IncrementalHierarchicalTree:
         for i, child in enumerate(node.children):
             self.print_tree(child, child_prefix, i == len(node.children) - 1)
 
+    def export_tree_dict(self, node: CapabilityNode | None = None) -> dict[str, Any]:
+        if node is None:
+            node = self.root
+        return {
+            "node_id": node.node_id,
+            "subtree_size": self._subtree_size(node),
+            "leaf_payload_size": len(node.data_ids),
+            "children_count": len(node.children),
+            "center_norm": float(np.linalg.norm(node.center)) if node.center is not None else 0.0,
+            "data_ids": list(node.data_ids),
+            "children": [self.export_tree_dict(c) for c in node.children],
+        }
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage 3: Incremental Hierarchical Clustering Tree")
@@ -284,11 +342,30 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl"),
     )
+    parser.add_argument(
+        "--output-tree-json",
+        type=Path,
+        default=Path("data/alpaca-gpt4-data-en/capability_tree_final.json"),
+        help="最终能力树结构输出路径",
+    )
+    parser.add_argument(
+        "--output-summary-json",
+        type=Path,
+        default=Path("data/alpaca-gpt4-data-en/capability_tree_summary.json"),
+        help="最终统计信息输出路径",
+    )
     parser.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-samples", type=int, default=1000, help="-1 for full dataset")
     parser.add_argument("--d-max", type=float, default=0.35, help="基础相关性阈值 D_max")
     parser.add_argument("--epsilon", type=float, default=1e-5)
+    parser.add_argument("--log-every", type=int, default=100, help="每处理多少条打印一次阶段快照")
+    parser.add_argument(
+        "--patience-no-new-node",
+        type=int,
+        default=0,
+        help="连续多少步未新增节点则提前收敛停止；0 表示关闭早停",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
 
@@ -323,11 +400,15 @@ def main() -> None:
     max_samples = None if args.max_samples == -1 else max(0, args.max_samples)
     cfg = Config(
         input_jsonl=args.input_jsonl,
+        output_tree_json=args.output_tree_json,
+        output_summary_json=args.output_summary_json,
         embedding_model=args.embedding_model,
         device=args.device,
         max_samples=max_samples,
         d_max=max(1e-8, args.d_max),
         epsilon=max(1e-12, args.epsilon),
+        log_every=max(1, args.log_every),
+        patience_no_new_node=max(0, args.patience_no_new_node),
         log_level=args.log_level,
     )
     if not cfg.input_jsonl.exists():
@@ -335,14 +416,57 @@ def main() -> None:
 
     tree = IncrementalHierarchicalTree(cfg)
     processed = 0
+    no_new_streak = 0
     for processed, (data_id, text) in enumerate(stream_rows(cfg.input_jsonl, cfg.max_samples), start=1):
-        tree.insert_one(data_id, text)
+        created = tree.insert_one(data_id, text)
+        if created > 0:
+            no_new_streak = 0
+        else:
+            no_new_streak += 1
+
+        if processed % cfg.log_every == 0:
+            logging.info(
+                "Processed=%d | depth=%d | level_counts=%s | global_J=%.6f | no_new_streak=%d",
+                processed,
+                tree.depth(),
+                tree.level_counts(),
+                tree.global_j(),
+                no_new_streak,
+            )
+
+        if cfg.patience_no_new_node > 0 and no_new_streak >= cfg.patience_no_new_node:
+            logging.info(
+                "Early convergence: no new node for %d consecutive steps at processed=%d.",
+                no_new_streak,
+                processed,
+            )
+            break
 
     if processed == 0:
         raise ValueError("No valid samples found.")
 
     logging.info("All samples inserted: %d", processed)
     tree.print_tree()
+
+    cfg.output_tree_json.parent.mkdir(parents=True, exist_ok=True)
+    cfg.output_summary_json.parent.mkdir(parents=True, exist_ok=True)
+    tree_payload = tree.export_tree_dict()
+    summary_payload = {
+        "processed": processed,
+        "total_nodes": len(tree._iter_nodes(tree.root)),
+        "depth": tree.depth(),
+        "level_counts": tree.level_counts(),
+        "global_J": tree.global_j(),
+        "patience_no_new_node": cfg.patience_no_new_node,
+        "final_no_new_streak": no_new_streak,
+        "converged_early": bool(cfg.patience_no_new_node > 0 and no_new_streak >= cfg.patience_no_new_node),
+    }
+    with cfg.output_tree_json.open("w", encoding="utf-8") as f:
+        json.dump(tree_payload, f, ensure_ascii=False, indent=2)
+    with cfg.output_summary_json.open("w", encoding="utf-8") as f:
+        json.dump(summary_payload, f, ensure_ascii=False, indent=2)
+    logging.info("Saved tree to: %s", cfg.output_tree_json)
+    logging.info("Saved summary to: %s", cfg.output_summary_json)
 
 
 if __name__ == "__main__":
