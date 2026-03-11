@@ -64,13 +64,23 @@ no children 修复
 
 
 - 修改收敛条件为没有节点的数据量从1增长到2
+- 
 - python src/4.1/stage3_overlapping_incremental_hierarchy.py \
   --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
-  --max-samples 1000 \
-  --d-max 0.45 \
+  --max-samples 1000000 \
+  --d-max 0.9 \
   --log-every 100 \
-  --patience-no-1to2-growth 80 \
+  --patience-no-1to2-growth 200 \
   --log-level INFO
+
+
+- 接下来写stage4:首先对stage3输出的树进行操作，自底向上剪掉原本只有一条数据的簇，如果这造成父节点只有一个子节点，则将该子节点替换父节点，输出新的capabulity_tree_summary和final
+
+- python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/alpaca-gpt4-data-en/capability_tree_final.json \
+  --output-tree-json data/alpaca-gpt4-data-en/capability_tree_final_pruned.json \
+  --output-summary-json data/alpaca-gpt4-data-en/capability_tree_summary_pruned.json
+
 
 <!-- <!-- <!-- <!-- - 数据集tag
 ```
