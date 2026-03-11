@@ -30,6 +30,11 @@ from transformers import (
 from trl import SFTTrainer
 
 try:
+    from modelscope import snapshot_download
+except Exception:  # noqa: BLE001
+    snapshot_download = None
+
+try:
     # 新版 trl 推荐使用 SFTConfig
     from trl import SFTConfig
 except Exception:  # noqa: BLE001
@@ -41,6 +46,8 @@ class TrainConfig:
     dataset_path: Path
     output_dir: Path
     base_model: str
+    model_source: str
+    modelscope_cache_dir: Path | None
     val_ratio: float
     seed: int
     max_seq_length: int
@@ -64,6 +71,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset_path", type=Path, required=True, help="输入训练集 JSONL 路径")
     parser.add_argument("--output_dir", type=Path, required=True, help="实验输出目录")
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-1.5B")
+    parser.add_argument(
+        "--model_source",
+        type=str,
+        choices=["modelscope", "hf"],
+        default="modelscope",
+        help="模型来源：默认从 ModelScope 下载。",
+    )
+    parser.add_argument(
+        "--modelscope_cache_dir",
+        type=Path,
+        default=None,
+        help="ModelScope 本地缓存目录（可选）。",
+    )
     parser.add_argument("--val_ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_seq_length", type=int, default=1024)
@@ -124,6 +144,19 @@ def get_dtype() -> torch.dtype:
             return torch.bfloat16
         return torch.float16
     return torch.float32
+
+
+def resolve_model_path(base_model: str, model_source: str, cache_dir: Path | None) -> str:
+    """根据来源解析模型路径。modelscope 时先下载到本地再返回本地路径。"""
+    if model_source == "hf":
+        return base_model
+    if snapshot_download is None:
+        raise ImportError("ModelScope is not installed. Please install: pip install modelscope")
+    local_dir = snapshot_download(
+        model_id=base_model,
+        cache_dir=str(cache_dir) if cache_dir is not None else None,
+    )
+    return str(local_dir)
 
 
 def build_training_args(cfg: TrainConfig) -> TrainingArguments:
@@ -197,6 +230,8 @@ def main() -> None:
         dataset_path=args.dataset_path,
         output_dir=args.output_dir,
         base_model=args.base_model,
+        model_source=args.model_source,
+        modelscope_cache_dir=args.modelscope_cache_dir,
         val_ratio=max(1e-4, min(0.5, args.val_ratio)),
         seed=args.seed,
         max_seq_length=max(128, args.max_seq_length),
@@ -223,12 +258,15 @@ def main() -> None:
     train_ds, eval_ds = prepare_dataset(cfg.dataset_path, cfg.val_ratio, cfg.seed)
     logging.info("Train size=%d, Eval size=%d", len(train_ds), len(eval_ds))
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, trust_remote_code=True)
+    model_path = resolve_model_path(cfg.base_model, cfg.model_source, cfg.modelscope_cache_dir)
+    logging.info("Model resolved from %s: %s", cfg.model_source, model_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        cfg.base_model,
+        model_path,
         trust_remote_code=True,
         torch_dtype=get_dtype(),
     )
