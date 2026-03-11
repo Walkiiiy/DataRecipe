@@ -62,7 +62,6 @@ class Config:
     device: str
     max_samples: int | None
     d_max: float
-    d_max_radius_scale: float
     epsilon: float
     log_every: int
     patience_no_new_node: int
@@ -222,17 +221,8 @@ class IncrementalHierarchicalTree:
         nearest_idx = int(np.argmin(np.asarray(dists)))
         d_min = dists[nearest_idx]
         nearest = node.children[nearest_idx]
-        # 动态阈值：基础阈值 + 最近簇半径项，避免 d_max 过小导致“全新建”
-        nearest_ids = self._get_subtree_ids(nearest)
-        if nearest_ids and nearest.center is not None:
-            mat_nearest = np.stack([self.vector_store[i] for i in nearest_ids], axis=0)
-            nearest_radius = float(np.max(np.linalg.norm(mat_nearest - nearest.center.reshape(1, -1), axis=1)))
-        else:
-            nearest_radius = 0.0
-        d_threshold = max(self.cfg.d_max, self.cfg.d_max_radius_scale * nearest_radius)
-
         # 状态 1: Create New（距离过远）
-        if d_min >= d_threshold:
+        if d_min >= self.cfg.d_max:
             node.children.append(self._new_leaf_node(data_id))
             self._refresh_center_upward(path)
             return
@@ -366,12 +356,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-samples", type=int, default=1000, help="-1 for full dataset")
     parser.add_argument("--d-max", type=float, default=0.35, help="基础相关性阈值 D_max")
-    parser.add_argument(
-        "--d-max-radius-scale",
-        type=float,
-        default=0.5,
-        help="动态阈值系数：threshold=max(D_max, scale*nearest_radius)",
-    )
     parser.add_argument("--epsilon", type=float, default=1e-5)
     parser.add_argument("--log-every", type=int, default=100, help="每处理多少条打印一次阶段快照")
     parser.add_argument(
@@ -420,7 +404,6 @@ def main() -> None:
         device=args.device,
         max_samples=max_samples,
         d_max=max(1e-8, args.d_max),
-        d_max_radius_scale=max(0.0, args.d_max_radius_scale),
         epsilon=max(1e-12, args.epsilon),
         log_every=max(1, args.log_every),
         patience_no_new_node=max(0, args.patience_no_new_node),
