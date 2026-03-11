@@ -62,6 +62,7 @@ class Config:
     device: str
     max_samples: int | None
     d_max: float
+    d_max_radius_scale: float
     epsilon: float
     log_every: int
     patience_no_new_node: int
@@ -198,15 +199,16 @@ class IncrementalHierarchicalTree:
 
         path 用于在局部结构变更后向上刷新 center。
         """
-        # Step 1: 边界判定。当前节点没有 children -> 直接挂一个新叶子。
+        # Step 1: 边界判定
+        # 1) root 且无子节点：创建第一个叶子分支
+        # 2) 非 root 叶子：直接吸收 data_id（叶子簇内合并），不再无限下挂新叶
         if node.is_leaf:
-            # 若该节点本身已有 data_ids，说明它从“叶子”演化为“内部节点”。
-            # 需要先把已有 payload 下沉为一个旧叶子，再追加新样本叶子。
-            if node.data_ids:
-                node.children.append(self._new_leaf_from_ids(node.data_ids))
-                node.data_ids = []
-
-            node.children.append(self._new_leaf_node(data_id))
+            if node is self.root:
+                node.children.append(self._new_leaf_node(data_id))
+            else:
+                if data_id not in node.data_ids:
+                    node.data_ids.append(data_id)
+                self._refresh_center(node)
             self._refresh_center_upward(path)
             return
 
@@ -220,9 +222,17 @@ class IncrementalHierarchicalTree:
         nearest_idx = int(np.argmin(np.asarray(dists)))
         d_min = dists[nearest_idx]
         nearest = node.children[nearest_idx]
+        # 动态阈值：基础阈值 + 最近簇半径项，避免 d_max 过小导致“全新建”
+        nearest_ids = self._get_subtree_ids(nearest)
+        if nearest_ids and nearest.center is not None:
+            mat_nearest = np.stack([self.vector_store[i] for i in nearest_ids], axis=0)
+            nearest_radius = float(np.max(np.linalg.norm(mat_nearest - nearest.center.reshape(1, -1), axis=1)))
+        else:
+            nearest_radius = 0.0
+        d_threshold = max(self.cfg.d_max, self.cfg.d_max_radius_scale * nearest_radius)
 
         # 状态 1: Create New（距离过远）
-        if d_min >= self.cfg.d_max:
+        if d_min >= d_threshold:
             node.children.append(self._new_leaf_node(data_id))
             self._refresh_center_upward(path)
             return
@@ -287,15 +297,13 @@ class IncrementalHierarchicalTree:
         return dict(sorted(counts.items(), key=lambda kv: kv[0]))
 
     def global_j(self) -> float:
-        # 全局用“叶子集合”作为最终簇集合
-        leaves = [n for n in self._iter_nodes(self.root) if n.is_leaf and n.data_ids]
-        if len(leaves) <= 1:
-            return 0.0
-        clusters = []
-        for leaf in leaves:
-            mat = np.stack([self.vector_store[i] for i in leaf.data_ids], axis=0)
-            clusters.append(mat)
-        return self.objective.evaluate(clusters)
+        # 全局 J：对整棵树每个“有至少2个子节点”的内部节点计算局部 J，再求和。
+        # 这样不会因叶子普遍单元素而恒为 0，更能反映层级结构质量。
+        total = 0.0
+        for n in self._iter_nodes(self.root):
+            if len(n.children) >= 2:
+                total += self._compute_j_children(n)
+        return float(total)
 
     def print_tree(self, node: CapabilityNode | None = None, prefix: str = "", is_last: bool = True) -> None:
         """ASCII 树打印。"""
@@ -358,6 +366,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-samples", type=int, default=1000, help="-1 for full dataset")
     parser.add_argument("--d-max", type=float, default=0.35, help="基础相关性阈值 D_max")
+    parser.add_argument(
+        "--d-max-radius-scale",
+        type=float,
+        default=0.5,
+        help="动态阈值系数：threshold=max(D_max, scale*nearest_radius)",
+    )
     parser.add_argument("--epsilon", type=float, default=1e-5)
     parser.add_argument("--log-every", type=int, default=100, help="每处理多少条打印一次阶段快照")
     parser.add_argument(
@@ -406,6 +420,7 @@ def main() -> None:
         device=args.device,
         max_samples=max_samples,
         d_max=max(1e-8, args.d_max),
+        d_max_radius_scale=max(0.0, args.d_max_radius_scale),
         epsilon=max(1e-12, args.epsilon),
         log_every=max(1, args.log_every),
         patience_no_new_node=max(0, args.patience_no_new_node),
