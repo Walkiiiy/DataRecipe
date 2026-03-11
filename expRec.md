@@ -33,6 +33,15 @@ no children 修复
   --route-top-k 2 \
   --log-level INFO
 
+
+
+- 你好，我们需要实现数据配方论文中基于 $\mathcal{J}$ 目标函数的最核心模块：“阶段三：动态增量层次聚类树 (Incremental Hierarchical Clustering Tree)”。请放弃之前的 K-Means 分裂逻辑。现在我们需要构建一棵能根据数据特征动态生长、分化层级的树。核心数据结构：实现 CapabilityNode 类：node_id: 节点唯一标识。center: 簇中心（子树所有向量的均值）。data_ids: 如果是叶子节点，存储数据的 ID 列表。children: 子节点列表（List of CapabilityNode）。核心演化逻辑 (The Engine)：初始化一个空的 Root 节点。对于数据流中的每一条向量 $v_i$，从 Root 开始递归调用 insert(node, v_i, data_id) 方法。在 insert 方法中，执行以下逻辑：Step 1: 边界判定如果当前 node.children 为空，直接在 node 下新建一个包含 $v_i$ 的叶子节点，并更新 node.center，结束插入。Step 2: 距离评估计算 $v_i$ 到 node.children 中所有子节点簇心的欧氏距离。找到距离最近的子节点 C_nearest，其距离记为 d_min。设定一个超参数 D_max（代表最基本的相关性阈值）。Step 3: 三态拓扑演化决策状态 1：新建 (Create New) - [触发条件: d_min >= D_max]说明 $v_i$ 与当前层级的所有知识分支都无关。操作：在 node 底下直接追加一个新的子节点（只包含 $v_i$），更新 node.center，结束该条数据的路由。具备基本相关性 - [触发条件: d_min < D_max]此时需要利用前面写好的 ObjectiveEvaluator 来计算当前 node.children 这一层级的目标函数 $\mathcal{J}$（密度 $\times$ 分离度的总和）。记录当前的得分为 $\mathcal{J}_{old}$。假想将 $v_i$ 强行并入 C_nearest 并更新其中心，计算假想状态下的得分为 $\mathcal{J}_{new}$。状态 2：合并 (Merge) - [触发条件: $\mathcal{J}_{new} \ge \mathcal{J}_{old}$]说明合并后簇的明确度提升或维持稳定。操作：正式将 $v_i$ 划入 C_nearest，更新其中心。然后递归调用 insert(C_nearest, v_i, data_id)，让数据继续向树的更细粒度深层路由。状态 3：分裂 (Split/Hierarchical Branching) - [触发条件: $\mathcal{J}_{new} < \mathcal{J}_{old}$]说明 $v_i$ 虽然与 C_nearest 沾边，但强行塞入会导致该节点内部过于庞杂，拖垮明确度。必须在这一层发生层级分化。操作：创建一个新的中间父节点 P_new。用 P_new 在 node.children 中替换掉原来的 C_nearest。然后，将原本的 C_nearest 以及一个仅包含 $v_i$ 的全新节点，共同作为 P_new 的子节点。自下而上更新簇心，结束路由。工程要求：请使用 Python 编写，要求代码模块化。在 insert 过程中，务必正确维护父子节点的 center 向量（每次变动都需要向上传导更新）。提供一个辅助打印函数 print_tree(node, level=0)，使用类似 ├── 的 ASCII 字符，在所有数据插入完成后，直观地打印出这棵能力树的层级结构和每个节点包含的数据量。
+- python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
+  --max-samples 1000 \
+  --d-max 0.35 \
+  --log-level INFO
+
 <!-- <!-- <!-- <!-- - 数据集tag
 ```
 OPENAI_API_KEY='sk-ab412f420cd540888da4732a35600c4a' OPENAI_BASE_URL='https://api.deepseek.com/v1' python src/4.1/stage1_atomic_profile.py   --model deepseek-chat   --max-samples 1000   --batch-size 8   --concurrency 10   --max-tokens 700   --output data/alpaca_with_tags.jsonl
