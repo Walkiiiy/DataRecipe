@@ -62,6 +62,16 @@ no children 修复
   --patience-no-new-node 120 \
   --log-level INFO
 
+
+- 修改收敛条件为没有节点的数据量从1增长到2
+- python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
+  --max-samples 1000 \
+  --d-max 0.45 \
+  --log-every 100 \
+  --patience-no-1to2-growth 80 \
+  --log-level INFO
+
 <!-- <!-- <!-- <!-- - 数据集tag
 ```
 OPENAI_API_KEY='sk-ab412f420cd540888da4732a35600c4a' OPENAI_BASE_URL='https://api.deepseek.com/v1' python src/4.1/stage1_atomic_profile.py   --model deepseek-chat   --max-samples 1000   --batch-size 8   --concurrency 10   --max-tokens 700   --output data/alpaca_with_tags.jsonl

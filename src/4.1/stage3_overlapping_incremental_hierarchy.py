@@ -64,7 +64,7 @@ class Config:
     d_max: float
     epsilon: float
     log_every: int
-    patience_no_new_node: int
+    patience_no_1to2_growth: int
     log_level: str
 
 
@@ -104,6 +104,7 @@ class IncrementalHierarchicalTree:
         self.vector_store: dict[str, np.ndarray] = {}
         self.node_seq = 0
         self.root = self._new_internal_node()
+        self._grew_1_to_2_in_last_insert = False
 
     # -----------------------------
     # 节点与中心更新辅助函数
@@ -205,8 +206,13 @@ class IncrementalHierarchicalTree:
             if node is self.root:
                 node.children.append(self._new_leaf_node(data_id))
             else:
+                before = len(node.data_ids)
                 if data_id not in node.data_ids:
                     node.data_ids.append(data_id)
+                after = len(node.data_ids)
+                # 记录本次插入是否出现“节点样本量从 1 增长到 2”的事件
+                if before == 1 and after == 2:
+                    self._grew_1_to_2_in_last_insert = True
                 self._refresh_center(node)
             self._refresh_center_upward(path)
             return
@@ -245,13 +251,14 @@ class IncrementalHierarchicalTree:
         node.children[nearest_idx] = p_new
         self._refresh_center_upward(path)
 
-    def insert_one(self, data_id: str, text: str) -> int:
+    def insert_one(self, data_id: str, text: str) -> tuple[int, bool]:
         before = self.node_seq
+        self._grew_1_to_2_in_last_insert = False
         vec = self.vectorizer.encode_one(text)
         self.vector_store[data_id] = vec
         self.insert(self.root, vec, data_id, path=[self.root])
         # 返回本次插入引入的新节点数量，供收敛判定使用
-        return self.node_seq - before
+        return self.node_seq - before, self._grew_1_to_2_in_last_insert
 
     # -----------------------------
     # 打印与统计
@@ -359,10 +366,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=1e-5)
     parser.add_argument("--log-every", type=int, default=100, help="每处理多少条打印一次阶段快照")
     parser.add_argument(
-        "--patience-no-new-node",
+        "--patience-no-1to2-growth",
         type=int,
         default=0,
-        help="连续多少步未新增节点则提前收敛停止；0 表示关闭早停",
+        help="连续多少步没有发生“节点数据量 1->2 增长”则提前收敛；0 表示关闭早停",
     )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
@@ -406,7 +413,7 @@ def main() -> None:
         d_max=max(1e-8, args.d_max),
         epsilon=max(1e-12, args.epsilon),
         log_every=max(1, args.log_every),
-        patience_no_new_node=max(0, args.patience_no_new_node),
+        patience_no_1to2_growth=max(0, args.patience_no_1to2_growth),
         log_level=args.log_level,
     )
     if not cfg.input_jsonl.exists():
@@ -414,28 +421,28 @@ def main() -> None:
 
     tree = IncrementalHierarchicalTree(cfg)
     processed = 0
-    no_new_streak = 0
+    no_1to2_streak = 0
     for processed, (data_id, text) in enumerate(stream_rows(cfg.input_jsonl, cfg.max_samples), start=1):
-        created = tree.insert_one(data_id, text)
-        if created > 0:
-            no_new_streak = 0
+        _created, grew_1_to_2 = tree.insert_one(data_id, text)
+        if grew_1_to_2:
+            no_1to2_streak = 0
         else:
-            no_new_streak += 1
+            no_1to2_streak += 1
 
         if processed % cfg.log_every == 0:
             logging.info(
-                "Processed=%d | depth=%d | level_counts=%s | global_J=%.6f | no_new_streak=%d",
+                "Processed=%d | depth=%d | level_counts=%s | global_J=%.6f | no_1to2_streak=%d",
                 processed,
                 tree.depth(),
                 tree.level_counts(),
                 tree.global_j(),
-                no_new_streak,
+                no_1to2_streak,
             )
 
-        if cfg.patience_no_new_node > 0 and no_new_streak >= cfg.patience_no_new_node:
+        if cfg.patience_no_1to2_growth > 0 and no_1to2_streak >= cfg.patience_no_1to2_growth:
             logging.info(
-                "Early convergence: no new node for %d consecutive steps at processed=%d.",
-                no_new_streak,
+                "Early convergence: no 1->2 node growth for %d consecutive steps at processed=%d.",
+                no_1to2_streak,
                 processed,
             )
             break
@@ -455,9 +462,11 @@ def main() -> None:
         "depth": tree.depth(),
         "level_counts": tree.level_counts(),
         "global_J": tree.global_j(),
-        "patience_no_new_node": cfg.patience_no_new_node,
-        "final_no_new_streak": no_new_streak,
-        "converged_early": bool(cfg.patience_no_new_node > 0 and no_new_streak >= cfg.patience_no_new_node),
+        "patience_no_1to2_growth": cfg.patience_no_1to2_growth,
+        "final_no_1to2_streak": no_1to2_streak,
+        "converged_early": bool(
+            cfg.patience_no_1to2_growth > 0 and no_1to2_streak >= cfg.patience_no_1to2_growth
+        ),
     }
     with cfg.output_tree_json.open("w", encoding="utf-8") as f:
         json.dump(tree_payload, f, ensure_ascii=False, indent=2)
