@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-jsonl",
         type=str,
-        default="data/alpaca-gpt4-data-en/alpaca_1000.jsonl",
+        default="data/alpaca-gpt4-data-en/train.jsonl",
         help="Input Alpaca JSONL file.",
     )
     parser.add_argument(
@@ -66,8 +66,8 @@ def parse_args() -> argparse.Namespace:
         help="Disable embedding normalization.",
     )
     parser.add_argument("--random-state", type=int, default=42)
-    parser.add_argument("--start-k", type=int, default=10)
-    parser.add_argument("--step", type=int, default=10)
+    parser.add_argument("--start-k", type=int, default=3)
+    parser.add_argument("--step", type=int, default=1)
     parser.add_argument(
         "--max-k",
         type=int,
