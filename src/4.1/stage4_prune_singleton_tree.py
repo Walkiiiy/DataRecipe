@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("data/alpaca-gpt4-data-en/capability_tree_summary_pruned.json"),
     )
+    parser.add_argument(
+        "--prune-leaf-size-threshold",
+        type=int,
+        default=1,
+        help="删除叶子簇的样本量阈值：当 leaf_payload_size <= threshold 时剪掉。",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
 
@@ -81,12 +87,12 @@ def recalc_node_fields(node: dict[str, Any]) -> None:
     node["subtree_size"] = len(collect_subtree_ids(node))
 
 
-def prune_bottom_up(node: dict[str, Any], stats: PruneStats) -> dict[str, Any] | None:
+def prune_bottom_up(node: dict[str, Any], stats: PruneStats, prune_leaf_size_threshold: int) -> dict[str, Any] | None:
     """返回裁剪后的节点；若整棵子树被删空则返回 None。"""
     children = node.get("children", [])
     pruned_children: list[dict[str, Any]] = []
     for child in children:
-        out = prune_bottom_up(child, stats)
+        out = prune_bottom_up(child, stats, prune_leaf_size_threshold)
         if out is not None:
             pruned_children.append(out)
     node["children"] = pruned_children
@@ -94,8 +100,8 @@ def prune_bottom_up(node: dict[str, Any], stats: PruneStats) -> dict[str, Any] |
     is_leaf = len(node["children"]) == 0
     payload = len(node.get("data_ids", []))
 
-    # 规则 1：删除单样本叶子簇
-    if is_leaf and payload == 1:
+    # 规则 1：删除小样本叶子簇（可配置阈值）
+    if is_leaf and payload <= prune_leaf_size_threshold and payload > 0:
         stats.removed_singleton_leaves += 1
         return None
 
@@ -153,6 +159,7 @@ def main() -> None:
     with args.input_tree_json.open("r", encoding="utf-8") as f:
         raw_tree = json.load(f)
     tree = normalize_node(raw_tree)
+    prune_threshold = max(1, args.prune_leaf_size_threshold)
 
     before_nodes = count_nodes(tree)
     before_depth = depth(tree)
@@ -161,7 +168,7 @@ def main() -> None:
     before_subtree_size = len(collect_subtree_ids(tree))
 
     stats = PruneStats()
-    pruned = prune_bottom_up(tree, stats)
+    pruned = prune_bottom_up(tree, stats, prune_threshold)
 
     if pruned is None:
         # 全部被剪空时，输出一个空根节点，避免后续流程读不到树结构。
@@ -204,6 +211,7 @@ def main() -> None:
             "subtree_size": after_subtree_size,
         },
         "prune_actions": {
+            "prune_leaf_size_threshold": prune_threshold,
             "removed_singleton_leaves": stats.removed_singleton_leaves,
             "removed_empty_nodes": stats.removed_empty_nodes,
             "collapsed_single_child_parents": stats.collapsed_single_child_parents,
