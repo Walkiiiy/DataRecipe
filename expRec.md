@@ -82,6 +82,40 @@ no children 修复
   --output-summary-json data/alpaca-gpt4-data-en/capability_tree_summary_pruned.json
 
 
+
+
+- 你好，我正在为我的大模型数据配方论文编写 4.1 节的核心对比实验。请在4.1/EXP中实现以下任务。我们需要在一套严格控制变量的框架下，对比三种不同的数据采样/配方策略对模型微调（SFT）效果的影响。前置条件与预算确定：我有一个基于动态 CDT 语义生成的层次聚类树文件 capability_tree_final.json，以及原始的 alpaca_cdt_profile.jsonl 数据集。首先，请编写一个函数解析 JSON 树，遍历所有叶子节点（簇）。筛选出包含数据量大于 10 的“有效簇”。将这些有效簇的数据量相加，得到本次实验的总数据预算 $N$。任务 1：数据采样脚本 (Data Sampling)请编写生成三个不同微调训练子集的脚本（输出三个 jsonl 文件），每个子集的数据总量必须严格为 $N$：dataset_ours.jsonl (基于能力树的分层采样)：从上述筛选出的“有效簇”中，按其原有比例（或均匀）精准采样出 $N$ 条数据。dataset_kmeans.jsonl (K-Means 基线)：提取全量数据的特征向量，使用 K-Means (K=8) 进行硬聚类，然后从 8 个簇中均匀采样，凑齐 $N$ 条数据。dataset_random.jsonl (随机基线)：从全量数据集中，使用随机种子无放回地直接抽取 $N$ 条数据。任务 2：隔离变量的 LoRA 微调脚本 (SFT Training)请使用 Hugging Face 的 transformers, peft (LoRA) 和 trl (SFTTrainer) 编写一个标准的指令微调脚本。基座模型：默认配置为 Qwen/Qwen2.5-1.5B（方便快速验证）。实验要求：写一个可以接收 --dataset_path 和 --output_dir 参数的 Python 脚本。确保除了输入的数据集不同，其他所有的超参数（LR, Batch Size, Epochs, LoRA r=8, alpha=16 等）绝对一致。评估记录：在训练过程中，务必每隔一段 Steps 记录 Training Loss 和 Validation Loss，并将日志保存为 JSON 或 CSV，方便后续画图。任务 3：全面的结果对比可视化 (Comprehensive Visualization)微调结束后，我们需要能够直接放在论文中的高质量对比图。请编写一个基于 matplotlib 和 seaborn 的画图脚本，读取三个实验的日志文件，生成并保存以下图表（要求包含图例、坐标轴标签、高分辨率 DPI=300）：Loss 衰减曲线图 (Learning Curves)：一张图中包含三条 Validation Loss 曲线，直观展示哪种采样方法让模型收敛得更低、更平稳。数据分布雷达图 (Data Distribution Radar Chart - 可选/模拟)：假设我们有一个能力维度的评分器，画一个雷达图对比这三种采样数据集在认知、领域、任务等几个主成分维度的覆盖均匀度（证明 Ours 的覆盖率最高、盲区最小）。最终性能柱状图 (Final Performance Bar Chart)：提取每个模型在最后一步的 Eval Loss（或假设存在的某个 Benchmark 得分），画一个对比柱状图，并在柱子上标注具体数值。工程要求：请提供高度模块化的 Python 代码，确保可以在 Ubuntu 环境和单张 GPU 下流畅运行。代码需包含详尽的中文注释。
+
+- # 1) 采样
+python src/4.1/EXP/data_sampling.py \
+  --tree-json data/alpaca-gpt4-data-en/capability_tree_final.json \
+  --profile-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
+  --out-dir data/alpaca-gpt4-data-en/exp \
+  --min-valid-cluster-size 10 \
+  --ours-mode proportional \
+  --kmeans-k 8
+
+# 2) 三组训练（只换 dataset_path/output_dir）
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/alpaca-gpt4-data-en/exp/dataset_ours.jsonl \
+  --output_dir data/alpaca-gpt4-data-en/exp/run_ours
+
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/alpaca-gpt4-data-en/exp/dataset_kmeans.jsonl \
+  --output_dir data/alpaca-gpt4-data-en/exp/run_kmeans
+
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/alpaca-gpt4-data-en/exp/dataset_random.jsonl \
+  --output_dir data/alpaca-gpt4-data-en/exp/run_random
+
+# 3) 画图
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/alpaca-gpt4-data-en/exp/run_ours/train_eval_log.csv \
+  --kmeans-log-csv data/alpaca-gpt4-data-en/exp/run_kmeans/train_eval_log.csv \
+  --random-log-csv data/alpaca-gpt4-data-en/exp/run_random/train_eval_log.csv \
+  --out-dir data/alpaca-gpt4-data-en/exp/figures
+
+
 <!-- <!-- <!-- <!-- - 数据集tag
 ```
 OPENAI_API_KEY='sk-ab412f420cd540888da4732a35600c4a' OPENAI_BASE_URL='https://api.deepseek.com/v1' python src/4.1/stage1_atomic_profile.py   --model deepseek-chat   --max-samples 1000   --batch-size 8   --concurrency 10   --max-tokens 700   --output data/alpaca_with_tags.jsonl
