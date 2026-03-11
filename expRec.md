@@ -116,6 +116,17 @@ python src/4.1/EXP/visualize_results.py \
   --out-dir data/alpaca-gpt4-data-en/exp/figures
 
 
+
+- 加测试集和测试脚本
+- python src/4.1/EXP/test_eval_and_plot.py \
+  --source_train_jsonl data/alpaca-gpt4-data-en/train.jsonl \
+  --ours_adapter_dir data/alpaca-gpt4-data-en/exp/run_ours/final_checkpoint \
+  --kmeans_adapter_dir data/alpaca-gpt4-data-en/exp/run_kmeans/final_checkpoint \
+  --random_adapter_dir data/alpaca-gpt4-data-en/exp/run_random/final_checkpoint \
+  --output_dir data/alpaca-gpt4-data-en/exp/test_eval \
+  --model_source modelscope \
+  --base_model Qwen/Qwen2.5-1.5B
+
 <!-- <!-- <!-- <!-- - 数据集tag
 ```
 OPENAI_API_KEY='sk-ab412f420cd540888da4732a35600c4a' OPENAI_BASE_URL='https://api.deepseek.com/v1' python src/4.1/stage1_atomic_profile.py   --model deepseek-chat   --max-samples 1000   --batch-size 8   --concurrency 10   --max-tokens 700   --output data/alpaca_with_tags.jsonl
