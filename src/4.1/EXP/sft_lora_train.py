@@ -238,6 +238,48 @@ def export_logs(log_history: list[dict[str, Any]], out_dir: Path) -> None:
     logging.info("Saved log csv: %s", csv_path)
 
 
+def build_sft_trainer(
+    model,
+    tokenizer,
+    train_ds: Dataset,
+    eval_ds: Dataset,
+    peft_cfg: LoraConfig,
+    train_args: TrainingArguments,
+    max_seq_length: int,
+):
+    """按 trl 版本签名自适配构造 SFTTrainer。"""
+    sig = inspect.signature(SFTTrainer.__init__)
+    params = sig.parameters
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "train_dataset": train_ds,
+        "eval_dataset": eval_ds,
+        "peft_config": peft_cfg,
+        "args": train_args,
+        "callbacks": [EvalLossCallback()],
+    }
+
+    # tokenizer 在不同版本中可能叫 tokenizer 或 processing_class
+    if "tokenizer" in params:
+        kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in params:
+        kwargs["processing_class"] = tokenizer
+
+    # 文本字段配置在不同版本中差异较大
+    if "dataset_text_field" in params:
+        kwargs["dataset_text_field"] = "text"
+    elif "formatting_func" in params:
+        kwargs["formatting_func"] = lambda x: x["text"]
+
+    if "max_seq_length" in params:
+        kwargs["max_seq_length"] = max_seq_length
+    if "packing" in params:
+        kwargs["packing"] = False
+
+    return SFTTrainer(**kwargs)
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -297,17 +339,14 @@ def main() -> None:
 
     train_args = build_training_args(cfg)
 
-    trainer = SFTTrainer(
+    trainer = build_sft_trainer(
         model=model,
         tokenizer=tokenizer,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        peft_config=peft_cfg,
-        args=train_args,
-        dataset_text_field="text",
+        train_ds=train_ds,
+        eval_ds=eval_ds,
+        peft_cfg=peft_cfg,
+        train_args=train_args,
         max_seq_length=cfg.max_seq_length,
-        packing=False,
-        callbacks=[EvalLossCallback()],
     )
 
     trainer.train()
