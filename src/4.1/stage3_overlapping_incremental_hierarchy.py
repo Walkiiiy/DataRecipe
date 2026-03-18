@@ -24,6 +24,8 @@ import numpy as np
 
 from stage2_objective_evaluator import ObjectiveEvaluator
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 try:
     import torch
     from sentence_transformers import SentenceTransformer
@@ -66,6 +68,22 @@ class Config:
     log_every: int
     patience_no_1to2_growth: int
     log_level: str
+
+
+def resolve_repo_path(path: Path) -> Path:
+    """将相对路径稳定解析到仓库根目录，避免受启动目录影响。"""
+    if path.is_absolute():
+        return path
+    return (REPO_ROOT / path).resolve()
+
+
+def default_output_paths(input_jsonl: Path) -> tuple[Path, Path]:
+    """根据输入数据集目录生成 stage3 默认输出路径。"""
+    base_dir = input_jsonl.parent
+    return (
+        base_dir / "capability_tree_final.json",
+        base_dir / "capability_tree_summary.json",
+    )
 
 
 class DenseVectorizer:
@@ -345,18 +363,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-jsonl",
         type=Path,
-        default=Path("data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl"),
+        default=REPO_ROOT / "data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl",
     )
     parser.add_argument(
         "--output-tree-json",
         type=Path,
-        default=Path("data/alpaca-gpt4-data-en/capability_tree_final.json"),
+        default=None,
         help="最终能力树结构输出路径",
     )
     parser.add_argument(
         "--output-summary-json",
         type=Path,
-        default=Path("data/alpaca-gpt4-data-en/capability_tree_summary.json"),
+        default=None,
         help="最终统计信息输出路径",
     )
     parser.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
@@ -403,10 +421,14 @@ def main() -> None:
     )
 
     max_samples = None if args.max_samples == -1 else max(0, args.max_samples)
+    input_jsonl = resolve_repo_path(args.input_jsonl)
+    default_tree_json, default_summary_json = default_output_paths(input_jsonl)
     cfg = Config(
-        input_jsonl=args.input_jsonl,
-        output_tree_json=args.output_tree_json,
-        output_summary_json=args.output_summary_json,
+        input_jsonl=input_jsonl,
+        output_tree_json=resolve_repo_path(args.output_tree_json) if args.output_tree_json else default_tree_json,
+        output_summary_json=(
+            resolve_repo_path(args.output_summary_json) if args.output_summary_json else default_summary_json
+        ),
         embedding_model=args.embedding_model,
         device=args.device,
         max_samples=max_samples,

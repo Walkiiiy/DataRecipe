@@ -12,6 +12,23 @@ python src/4.1/stage1_atomic_profile.py \
   --model deepseek-chat \
   --base-url https://api.deepseek.com
 
+python src/4.1/stage1_atomic_profile.py \
+  --input data/dolly-15k/train.jsonl \
+  --output data/dolly-15k/dolly-15k_cdt_profile.jsonl \
+  --max-samples 10000000 \
+  --concurrency 32 \
+  --model deepseek-chat \
+  --base-url https://api.deepseek.com
+
+
+  python src/4.1/stage1_atomic_profile.py \
+  --input data/data_ablation_full59K/train.jsonl \
+  --output data/data_ablation_full59K/data_ablation_full59K_cdt_profile.jsonl \
+  --max-samples 10000000 \
+  --concurrency 32 \
+  --model deepseek-chat \
+  --base-url https://api.deepseek.com
+
 - 非常好。现在我们需要在4.1实现“阶段二：基于密度与分离度的目标函数计算引擎”。核心任务：编写一个 Python 模块，包含用于计算聚类状态的评估函数。该评价体系由“簇内密度”和“簇间分离度”组成，不需要任何平衡系数。数学公式与要求（请严格使用 PyTorch 或 Numpy 实现矩阵运算）：给定一个簇的集合 $\mathcal{C} = \{C_1, C_2, \dots, C_k\}$，每个簇包含若干稠密特征向量。簇内密度 (Density)：计算公式为该簇内所有向量到簇心 $c_k$ 的欧氏距离之和，除以最大距离（防除零）。$$Dens(C_k) = \frac{\sum_{x \in C_k} ||x - c_k||}{\max_{x \in C_k} ||x - c_k|| + 1e-5}$$簇间分离度 (Separation)：计算公式为该簇心到其他所有簇心的平均欧氏距离。如果当前系统只有一个簇，则分离度定义为 0。$$Sep(C_k) = \frac{1}{|\mathcal{C}| - 1} \sum_{j \neq k} ||c_k - c_j||$$全局目标函数 ($\mathcal{J}$)：所有簇的密度与分离度乘积的总和。$$\mathcal{J}(\mathcal{C}) = \sum_{C_k \in \mathcal{C}} \left( Dens(C_k) \times Sep(C_k) \right)$$代码结构要求：请封装一个 ObjectiveEvaluator 类，接收包含多个簇向量的列表，返回全局 $\mathcal{J}$ 值。请特别注意处理极端边界情况（例如某个簇只有一个元素时，$\max$ 距离为 0 的处理；全局只有一个簇时 $\mathcal{J}=0$ 的处理）。
 
 - 在4.1实现“阶段三：基于 $\mathcal{J}$ 目标函数的多路径增量层次聚类树 (Overlapping Incremental Hierarchical Clustering)”。核心数据结构设计：请实现一个 CapabilityNode 类（树节点），包含以下属性：node_id: 唯一标识符。center: 簇中心特征向量。data_ids: 属于该节点的数据 ID 列表。children: 子节点列表（List of CapabilityNode）。level: 当前节点所在的层级（Root 为 0）。算法执行逻辑 (从 Root 开始逐条插入 $v_i$)：编写一个递归的 insert(node, v_i, data_id) 方法。当数据 $v_i$ 到达某个 node 时：Step 1: 软分配路由 (Soft Routing)如果 node 没有 children（即为叶子节点），则将 $v_i$ 暂存入该节点。如果 node 有 children，计算 $v_i$ 到所有子节点中心的距离。选出距离小于某个动态阈值（例如该子节点内部最大半径 $D$）的所有子节点（或者选 Top-2）。将 $v_i$ 递归调用 insert 压入这些符合条件的子节点中（实现一条数据属于多个簇的重叠属性）。Step 2: 基于 $\mathcal{J}$ 的同层拓扑演化 (Topology Evolution)在 $v_i$ 压入后，我们需要检查当前 node 的子节点层级（node.children）是否需要演化。使用之前写好的 ObjectiveEvaluator（计算密度与分离度乘积的和）计算当前的 $\mathcal{J}_{current}$。构造假想状态：状态 A (维持现状)：$\mathcal{J}_{absorb} = \mathcal{J}_{current}$。状态 B (分裂/新建分支)：如果刚才被压入的子节点内部变得非常拥挤，尝试将其内部的数据使用 K-Means(K=2) 打碎，变成当前 node 的两个新子节点。计算 $\mathcal{J}_{split}$。状态 C (合并冗余)：寻找当前 node.children 中中心距离最近的两个子节点，将它们合并为一个。计算 $\mathcal{J}_{merge}$。Step 3: 贪心决策取 $\mathcal{J}_{absorb}, \mathcal{J}_{split}, \mathcal{J}_{merge}$ 的最大值。执行对应的拓扑变换，并更新受影响节点的中心向量。工程要求：算法初始化时，创建一个空的 Root 节点。顺序流式（Streaming）读取 alpaca_cdt_profile.jsonl，提取稠密向量并调用 Root.insert()。请使用 logging 打印一棵 ASCII 风格的能力树（Tree print），在每处理 100 条数据后，展示当前树的深度、每一层的节点数，以及全局 $\mathcal{J}$ 值，以证明层次结构正在动态生长。代码请加满详尽的中文注释，确保数学公式与树状数据结构的逻辑清晰解耦。
@@ -23,7 +40,7 @@ python src/4.1/stage1_atomic_profile.py \
   --route-top-k 2 \
   --split-min-size 8 \
   --split-density-threshold 3.0 -->
-no children 修复
+<!-- no children 修复
 - python src/4.1/stage3_overlapping_incremental_hierarchy.py \
   --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
   --max-samples 1000 \
@@ -31,21 +48,21 @@ no children 修复
   --split-min-size 8 \
   --split-density-threshold 1.5 \
   --route-top-k 2 \
-  --log-level INFO
+  --log-level INFO -->
 
 
 
 - 你好，我们需要实现数据配方论文中基于 $\mathcal{J}$ 目标函数的最核心模块：“阶段三：动态增量层次聚类树 (Incremental Hierarchical Clustering Tree)”。请放弃之前的 K-Means 分裂逻辑。现在我们需要构建一棵能根据数据特征动态生长、分化层级的树。核心数据结构：实现 CapabilityNode 类：node_id: 节点唯一标识。center: 簇中心（子树所有向量的均值）。data_ids: 如果是叶子节点，存储数据的 ID 列表。children: 子节点列表（List of CapabilityNode）。核心演化逻辑 (The Engine)：初始化一个空的 Root 节点。对于数据流中的每一条向量 $v_i$，从 Root 开始递归调用 insert(node, v_i, data_id) 方法。在 insert 方法中，执行以下逻辑：Step 1: 边界判定如果当前 node.children 为空，直接在 node 下新建一个包含 $v_i$ 的叶子节点，并更新 node.center，结束插入。Step 2: 距离评估计算 $v_i$ 到 node.children 中所有子节点簇心的欧氏距离。找到距离最近的子节点 C_nearest，其距离记为 d_min。设定一个超参数 D_max（代表最基本的相关性阈值）。Step 3: 三态拓扑演化决策状态 1：新建 (Create New) - [触发条件: d_min >= D_max]说明 $v_i$ 与当前层级的所有知识分支都无关。操作：在 node 底下直接追加一个新的子节点（只包含 $v_i$），更新 node.center，结束该条数据的路由。具备基本相关性 - [触发条件: d_min < D_max]此时需要利用前面写好的 ObjectiveEvaluator 来计算当前 node.children 这一层级的目标函数 $\mathcal{J}$（密度 $\times$ 分离度的总和）。记录当前的得分为 $\mathcal{J}_{old}$。假想将 $v_i$ 强行并入 C_nearest 并更新其中心，计算假想状态下的得分为 $\mathcal{J}_{new}$。状态 2：合并 (Merge) - [触发条件: $\mathcal{J}_{new} \ge \mathcal{J}_{old}$]说明合并后簇的明确度提升或维持稳定。操作：正式将 $v_i$ 划入 C_nearest，更新其中心。然后递归调用 insert(C_nearest, v_i, data_id)，让数据继续向树的更细粒度深层路由。状态 3：分裂 (Split/Hierarchical Branching) - [触发条件: $\mathcal{J}_{new} < \mathcal{J}_{old}$]说明 $v_i$ 虽然与 C_nearest 沾边，但强行塞入会导致该节点内部过于庞杂，拖垮明确度。必须在这一层发生层级分化。操作：创建一个新的中间父节点 P_new。用 P_new 在 node.children 中替换掉原来的 C_nearest。然后，将原本的 C_nearest 以及一个仅包含 $v_i$ 的全新节点，共同作为 P_new 的子节点。自下而上更新簇心，结束路由。工程要求：请使用 Python 编写，要求代码模块化。在 insert 过程中，务必正确维护父子节点的 center 向量（每次变动都需要向上传导更新）。提供一个辅助打印函数 print_tree(node, level=0)，使用类似 ├── 的 ASCII 字符，在所有数据插入完成后，直观地打印出这棵能力树的层级结构和每个节点包含的数据量。
-- python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+<!-- - python src/4.1/stage3_overlapping_incremental_hierarchy.py \
   --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
   --max-samples 1000 \
   --d-max 0.35 \
-  --log-level INFO
+  --log-level INFO -->
 
 
 - 给我把原来的log-every功能加上，并且加入一个参数，当连续几步都没有新节点被新建时，能力空间构建完毕，就收敛结束，并且把最后结果保存下来。
 
-- python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+<!-- - python src/4.1/stage3_overlapping_incremental_hierarchy.py \
   --input-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
   --max-samples 1000 \
   --d-max 0.35 \
@@ -60,7 +77,7 @@ no children 修复
   --d-max-radius-scale 0.8 \
   --log-every 100 \
   --patience-no-new-node 120 \
-  --log-level INFO
+  --log-level INFO -->
 
 
 - 修改收敛条件为没有节点的数据量从1增长到2
@@ -73,6 +90,24 @@ no children 修复
   --patience-no-1to2-growth 200 \
   --log-level INFO
 
+  python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/dolly-15k/dolly-15k_cdt_profile.jsonl \
+  --max-samples 1000000 \
+  --d-max 0.8 \
+  --log-every 100 \
+  --patience-no-1to2-growth 200 \
+  --log-level INFO
+
+
+    python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/data_ablation_full59K/data_ablation_full59K_cdt_profile.jsonl \
+  --max-samples 1000000 \
+  --d-max 0.9 \
+  --log-every 100 \
+  --patience-no-1to2-growth 200 \
+  --log-level INFO
+
+-------------------------------------------------------------------------------
 
 - 接下来写stage4:首先对stage3输出的树进行操作，自底向上剪掉原本只有一条数据的簇，如果这造成父节点只有一个子节点，则将该子节点替换父节点，输出新的capabulity_tree_summary和final
 
@@ -83,17 +118,45 @@ no children 修复
 
 
 
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/dolly-15k/capability_tree_final.json \
+  --output-tree-json data/dolly-15k/capability_tree_final_pruned.json \
+  --output-summary-json data/dolly-15k/capability_tree_summary_pruned.json
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/data_ablation_full59K/capability_tree_final.json \
+  --output-tree-json data/data_ablation_full59K/capability_tree_final_pruned.json \
+  --output-summary-json data/data_ablation_full59K/capability_tree_summary_pruned.json
+
+
 
 - 你好，我正在为我的大模型数据配方论文编写 4.1 节的核心对比实验。请在4.1/EXP中实现以下任务。我们需要在一套严格控制变量的框架下，对比三种不同的数据采样/配方策略对模型微调（SFT）效果的影响。前置条件与预算确定：我有一个基于动态 CDT 语义生成的层次聚类树文件 capability_tree_final.json，以及原始的 alpaca_cdt_profile.jsonl 数据集。首先，请编写一个函数解析 JSON 树，遍历所有叶子节点（簇）。筛选出包含数据量大于 10 的“有效簇”。将这些有效簇的数据量相加，得到本次实验的总数据预算 $N$。任务 1：数据采样脚本 (Data Sampling)请编写生成三个不同微调训练子集的脚本（输出三个 jsonl 文件），每个子集的数据总量必须严格为 $N$：dataset_ours.jsonl (基于能力树的分层采样)：从上述筛选出的“有效簇”中，按其原有比例（或均匀）精准采样出 $N$ 条数据。dataset_kmeans.jsonl (K-Means 基线)：提取全量数据的特征向量，使用 K-Means (K=8) 进行硬聚类，然后从 8 个簇中均匀采样，凑齐 $N$ 条数据。dataset_random.jsonl (随机基线)：从全量数据集中，使用随机种子无放回地直接抽取 $N$ 条数据。任务 2：隔离变量的 LoRA 微调脚本 (SFT Training)请使用 Hugging Face 的 transformers, peft (LoRA) 和 trl (SFTTrainer) 编写一个标准的指令微调脚本。基座模型：默认配置为 Qwen/Qwen2.5-1.5B（方便快速验证）。实验要求：写一个可以接收 --dataset_path 和 --output_dir 参数的 Python 脚本。确保除了输入的数据集不同，其他所有的超参数（LR, Batch Size, Epochs, LoRA r=8, alpha=16 等）绝对一致。评估记录：在训练过程中，务必每隔一段 Steps 记录 Training Loss 和 Validation Loss，并将日志保存为 JSON 或 CSV，方便后续画图。任务 3：全面的结果对比可视化 (Comprehensive Visualization)微调结束后，我们需要能够直接放在论文中的高质量对比图。请编写一个基于 matplotlib 和 seaborn 的画图脚本，读取三个实验的日志文件，生成并保存以下图表（要求包含图例、坐标轴标签、高分辨率 DPI=300）：Loss 衰减曲线图 (Learning Curves)：一张图中包含三条 Validation Loss 曲线，直观展示哪种采样方法让模型收敛得更低、更平稳。数据分布雷达图 (Data Distribution Radar Chart - 可选/模拟)：假设我们有一个能力维度的评分器，画一个雷达图对比这三种采样数据集在认知、领域、任务等几个主成分维度的覆盖均匀度（证明 Ours 的覆盖率最高、盲区最小）。最终性能柱状图 (Final Performance Bar Chart)：提取每个模型在最后一步的 Eval Loss（或假设存在的某个 Benchmark 得分），画一个对比柱状图，并在柱子上标注具体数值。工程要求：请提供高度模块化的 Python 代码，确保可以在 Ubuntu 环境和单张 GPU 下流畅运行。代码需包含详尽的中文注释。
 
 - # 1) 采样
 python src/4.1/EXP/data_sampling.py \
-  --tree-json data/alpaca-gpt4-data-en/capability_tree_final.json \
+  --tree-json data/dolly-15k/capability_tree_final_pruned.json \
+  --profile-jsonl data/dolly-15k/dolly-15k_cdt_profile.jsonl \
+  --out-dir data/dolly-15k/exp \
+  --min-valid-cluster-size 10 \
+  --ours-mode proportional \
+  --kmeans-k 7
+
+python src/4.1/EXP/data_sampling.py \
+  --tree-json data/alpaca-gpt4-data-en/capability_tree_final_pruned.json \
   --profile-jsonl data/alpaca-gpt4-data-en/alpaca_cdt_profile.jsonl \
   --out-dir data/alpaca-gpt4-data-en/exp \
   --min-valid-cluster-size 10 \
   --ours-mode proportional \
   --kmeans-k 8
+
+
+python src/4.1/EXP/data_sampling.py \
+  --tree-json data/data_ablation_full59K/capability_tree_final_pruned.json \
+  --profile-jsonl data/data_ablation_full59K/data_ablation_full59K_cdt_profile.jsonl \
+  --out-dir data/data_ablation_full59K/exp \
+  --min-valid-cluster-size 10 \
+  --ours-mode proportional \
+  --kmeans-k 3
 
 # 2) 三组训练（只换 dataset_path/output_dir）
 python src/4.1/EXP/sft_lora_train.py \
@@ -108,13 +171,62 @@ python src/4.1/EXP/sft_lora_train.py \
   --dataset_path data/alpaca-gpt4-data-en/exp/dataset_random.jsonl \
   --output_dir data/alpaca-gpt4-data-en/exp/run_random
 
+
+-----------------------------------------------------------------------------
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/dolly-15k/exp/dataset_ours.jsonl \
+  --output_dir data/dolly-15k/exp/run_ours
+
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/dolly-15k/exp/dataset_kmeans.jsonl \
+  --output_dir data/dolly-15k/exp/run_kmeans
+
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/dolly-15k/exp/dataset_random.jsonl \
+  --output_dir data/dolly-15k/exp/run_random
+
+
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/dolly-15k/exp/dataset_category.jsonl \
+  --output_dir data/dolly-15k/exp/run_random
+
+
+------------------------------------------------------------------------------
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/data_ablation_full59K/exp/dataset_ours.jsonl \
+  --output_dir data/data_ablation_full59K/exp/run_ours
+
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/data_ablation_full59K/exp/dataset_kmeans.jsonl \
+  --output_dir data/data_ablation_full59K/exp/run_kmeans
+
+python src/4.1/EXP/sft_lora_train.py \
+  --dataset_path data/data_ablation_full59K/exp/dataset_random.jsonl \
+  --output_dir data/data_ablation_full59K/exp/run_random
+
+
 # 3) 画图
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/dolly-15k/exp/run_ours/train_eval_log.csv \
+  --kmeans-log-csv data/dolly-15k/exp/run_kmeans/train_eval_log.csv \
+  --random-log-csv data/dolly-15k/exp/run_random/train_eval_log.csv \
+  --category-log-csv data/dolly-15k/exp/run_category/train_eval_log.csv \
+  --out-dir data/dolly-15k/exp/figures
+
 python src/4.1/EXP/visualize_results.py \
   --ours-log-csv data/alpaca-gpt4-data-en/exp/run_ours/train_eval_log.csv \
   --kmeans-log-csv data/alpaca-gpt4-data-en/exp/run_kmeans/train_eval_log.csv \
   --random-log-csv data/alpaca-gpt4-data-en/exp/run_random/train_eval_log.csv \
+  --category-log-csv data/alpaca-gpt4-data-en/exp/run_category/train_eval_log.csv \
   --out-dir data/alpaca-gpt4-data-en/exp/figures
 
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/data_ablation_full59K/exp/run_ours/train_eval_log.csv \
+  --kmeans-log-csv data/data_ablation_full59K/exp/run_kmeans/train_eval_log.csv \
+  --random-log-csv data/data_ablation_full59K/exp/run_random/train_eval_log.csv \
+  --category-log-csv data/data_ablation_full59K/exp/run_category/train_eval_log.csv \
+  --out-dir data/data_ablation_full59K/exp/figures
 
 
 - 加测试集和测试脚本
@@ -123,9 +235,70 @@ python src/4.1/EXP/visualize_results.py \
   --ours_adapter_dir data/alpaca-gpt4-data-en/exp/run_ours/final_checkpoint \
   --kmeans_adapter_dir data/alpaca-gpt4-data-en/exp/run_kmeans/final_checkpoint \
   --random_adapter_dir data/alpaca-gpt4-data-en/exp/run_random/final_checkpoint \
+  --category_adapter_dir data/alpaca-gpt4-data-en/exp/run_category/final_checkpoint \
   --output_dir data/alpaca-gpt4-data-en/exp/test_eval \
   --model_source modelscope \
   --base_model Qwen/Qwen2.5-1.5B
+
+
+python src/4.1/EXP/test_eval_and_plot.py \
+  --source_train_jsonl data/dolly-15k/train.jsonl \
+  --ours_adapter_dir data/dolly-15k/exp/run_ours/final_checkpoint \
+  --kmeans_adapter_dir data/dolly-15k/exp/run_kmeans/final_checkpoint \
+  --random_adapter_dir data/dolly-15k/exp/run_random/final_checkpoint \
+  --category_adapter_dir data/dolly-15k/exp/run_category/final_checkpoint \
+  --output_dir data/dolly-15k/exp/test_eval \
+  --model_source modelscope \
+  --base_model Qwen/Qwen2.5-1.5B
+
+
+
+python src/4.1/EXP/test_eval_and_plot.py \
+  --source_train_jsonl data/data_ablation_full59K/train.jsonl \
+  --ours_adapter_dir data/data_ablation_full59K/exp/run_ours/final_checkpoint \
+  --kmeans_adapter_dir data/data_ablation_full59K/exp/run_kmeans/final_checkpoint \
+  --random_adapter_dir data/data_ablation_full59K/exp/run_random/final_checkpoint \
+  --category_adapter_dir data/data_ablation_full59K/exp/run_category/final_checkpoint \
+  --output_dir data/data_ablation_full59K/exp/test_eval \
+  --model_source modelscope \
+  --base_model Qwen/Qwen2.5-1.5B
+
+
+
+
+-------------------------------------------------------------------------------
+- 对自带划分的数据集添加额外采样：
+详细分析现在的data_sampling.py是怎么对数据集进行采样的，现有是三种采样方法。对于data/dolly-15k/databricks-dolly-15k.raw.jsonl这种自带catagory的数据集，还要加一种采样方法就是用他自己自带的分类方法采样。我需要你单独写一个脚本，生成和上面data_sampling类似的采样数据，不过是用数据集自带的分类来采样
+- python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/dolly-15k/databricks-dolly-15k.raw.jsonl \
+  --out-dir data/dolly-15k/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 2443 \
+  --random-seed 42
+-----------------------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 <!-- <!-- <!-- <!-- - 数据集tag
 ```

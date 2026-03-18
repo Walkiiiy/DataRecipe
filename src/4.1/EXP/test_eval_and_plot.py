@@ -1,7 +1,7 @@
 """4.1 EXP - 统一测试集评估与出图脚本。
 
 功能：
-1) 在同一份测试集上，评估三组 LoRA 模型（ours/kmeans/random）的 test loss 与 perplexity。
+1) 在同一份测试集上，评估三组或四组 LoRA 模型（ours/kmeans/random[/category]）的 test loss 与 perplexity。
 2) 导出结构化结果（JSON/CSV）。
 3) 自动绘制最终测试性能柱状图（DPI=300），可直接用于论文对比。
 """
@@ -46,13 +46,14 @@ class EvalConfig:
     ours_adapter_dir: Path
     kmeans_adapter_dir: Path
     random_adapter_dir: Path
+    category_adapter_dir: Path | None
     batch_size: int
     max_seq_length: int
     dpi: int
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate three LoRA models on a shared test set and plot")
+    parser = argparse.ArgumentParser(description="Evaluate LoRA models on a shared test set and plot")
     parser.add_argument("--test_dataset_path", type=Path, default=None, help="统一测试集 JSONL（可选）")
     parser.add_argument(
         "--source_train_jsonl",
@@ -69,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ours_adapter_dir", type=Path, required=True, help="ours 模型 LoRA 目录")
     parser.add_argument("--kmeans_adapter_dir", type=Path, required=True, help="kmeans 模型 LoRA 目录")
     parser.add_argument("--random_adapter_dir", type=Path, required=True, help="random 模型 LoRA 目录")
+    parser.add_argument("--category_adapter_dir", type=Path, default=None, help="可选：category 模型 LoRA 目录")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--max_seq_length", type=int, default=1024)
     parser.add_argument("--dpi", type=int, default=300)
@@ -289,12 +291,19 @@ def plot_bars(metrics: list[dict[str, Any]], out_dir: Path, dpi: int) -> None:
     labels = [m["method"] for m in metrics]
     loss_vals = [float(m["test_loss"]) for m in metrics]
     ppl_vals = [float(m["perplexity"]) for m in metrics]
+    color_map = {
+        "Ours": "#1f77b4",
+        "KMeans": "#ff7f0e",
+        "Random": "#2ca02c",
+        "Category": "#d62728",
+    }
+    palette = [color_map.get(x, "#7f7f7f") for x in labels]
 
     sns.set_theme(style="whitegrid")
     fig, axes = plt.subplots(1, 2, figsize=(11.5, 4.8))
 
     # 左图：test loss
-    sns.barplot(x=labels, y=loss_vals, ax=axes[0], palette=["#1f77b4", "#ff7f0e", "#2ca02c"])
+    sns.barplot(x=labels, y=loss_vals, ax=axes[0], palette=palette)
     axes[0].set_title("Final Test Loss")
     axes[0].set_xlabel("Sampling Strategy")
     axes[0].set_ylabel("Test Loss")
@@ -302,7 +311,7 @@ def plot_bars(metrics: list[dict[str, Any]], out_dir: Path, dpi: int) -> None:
         axes[0].text(i, v + 0.005, f"{v:.4f}", ha="center", va="bottom", fontsize=9)
 
     # 右图：perplexity
-    sns.barplot(x=labels, y=ppl_vals, ax=axes[1], palette=["#1f77b4", "#ff7f0e", "#2ca02c"])
+    sns.barplot(x=labels, y=ppl_vals, ax=axes[1], palette=palette)
     axes[1].set_title("Final Test Perplexity")
     axes[1].set_xlabel("Sampling Strategy")
     axes[1].set_ylabel("Perplexity")
@@ -335,6 +344,7 @@ def main() -> None:
         ours_adapter_dir=args.ours_adapter_dir,
         kmeans_adapter_dir=args.kmeans_adapter_dir,
         random_adapter_dir=args.random_adapter_dir,
+        category_adapter_dir=args.category_adapter_dir,
         batch_size=max(1, args.batch_size),
         max_seq_length=max(128, args.max_seq_length),
         dpi=max(100, args.dpi),
@@ -398,6 +408,18 @@ def main() -> None:
             device=device,
         )
     )
+    if cfg.category_adapter_dir is not None:
+        metrics.append(
+            evaluate_one(
+                name="Category",
+                base_model_path=base_model_path,
+                adapter_dir=cfg.category_adapter_dir,
+                tokenizer=tokenizer,
+                encoded_ds=encoded_ds,
+                batch_size=cfg.batch_size,
+                device=device,
+            )
+        )
 
     save_metrics(metrics, cfg.output_dir)
     plot_bars(metrics, cfg.output_dir, cfg.dpi)

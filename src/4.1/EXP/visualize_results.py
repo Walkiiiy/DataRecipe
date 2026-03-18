@@ -1,7 +1,7 @@
 """4.1 EXP - 结果可视化脚本（论文图）。
 
 输入：
-- 三组实验日志（train_eval_log.csv）
+- 三组或四组实验日志（train_eval_log.csv）
 - 可选：雷达图评分 JSON（若无则使用模拟分数）
 
 输出（DPI=300）：
@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ours-log-csv", type=Path, required=True)
     parser.add_argument("--kmeans-log-csv", type=Path, required=True)
     parser.add_argument("--random-log-csv", type=Path, required=True)
+    parser.add_argument("--category-log-csv", type=Path, default=None, help="可选：category 采样实验日志 CSV")
     parser.add_argument(
         "--radar-scores-json",
         type=Path,
@@ -85,21 +86,36 @@ def ensure_out_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def build_log_map(args: argparse.Namespace) -> dict[str, list[dict[str, Any]]]:
+    logs = {
+        "ours": load_log_csv(args.ours_log_csv),
+        "kmeans": load_log_csv(args.kmeans_log_csv),
+        "random": load_log_csv(args.random_log_csv),
+    }
+    if args.category_log_csv is not None:
+        logs["category"] = load_log_csv(args.category_log_csv)
+    return logs
+
+
 def plot_learning_curves(
-    ours: list[dict[str, Any]],
-    kmeans: list[dict[str, Any]],
-    random_rows: list[dict[str, Any]],
+    logs: dict[str, list[dict[str, Any]]],
     out_path: Path,
     dpi: int,
 ) -> None:
     sns.set_theme(style="whitegrid")
     plt.figure(figsize=(8.5, 5.2))
 
-    for name, rows, color in [
-        ("Ours (Tree Sampling)", ours, "#1f77b4"),
-        ("KMeans Baseline", kmeans, "#ff7f0e"),
-        ("Random Baseline", random_rows, "#2ca02c"),
-    ]:
+    style = {
+        "ours": ("Ours (Tree Sampling)", "#1f77b4"),
+        "kmeans": ("KMeans Baseline", "#ff7f0e"),
+        "random": ("Random Baseline", "#2ca02c"),
+        "category": ("Category Baseline", "#d62728"),
+    }
+    for key in ["ours", "kmeans", "random", "category"]:
+        if key not in logs:
+            continue
+        name, color = style[key]
+        rows = logs[key]
         x, y = extract_eval_curve(rows)
         if len(x) == 0:
             logging.warning("No eval curve found for %s", name)
@@ -126,6 +142,7 @@ def load_or_simulate_radar_scores(path: Path | None) -> dict[str, dict[str, floa
         "ours": {"Cognition": 0.88, "Domain": 0.86, "Task": 0.90},
         "kmeans": {"Cognition": 0.80, "Domain": 0.79, "Task": 0.81},
         "random": {"Cognition": 0.72, "Domain": 0.70, "Task": 0.74},
+        "category": {"Cognition": 0.83, "Domain": 0.82, "Task": 0.84},
     }
 
 
@@ -142,8 +159,9 @@ def plot_radar(scores: dict[str, dict[str, float]], out_path: Path, dpi: int) ->
         "ours": ("Ours (Tree Sampling)", "#1f77b4"),
         "kmeans": ("KMeans Baseline", "#ff7f0e"),
         "random": ("Random Baseline", "#2ca02c"),
+        "category": ("Category Baseline", "#d62728"),
     }
-    for key in ["ours", "kmeans", "random"]:
+    for key in ["ours", "kmeans", "random", "category"]:
         if key not in scores:
             continue
         values = [float(scores[key][d]) for d in dims]
@@ -163,22 +181,30 @@ def plot_radar(scores: dict[str, dict[str, float]], out_path: Path, dpi: int) ->
 
 
 def plot_final_bar(
-    ours: list[dict[str, Any]],
-    kmeans: list[dict[str, Any]],
-    random_rows: list[dict[str, Any]],
+    logs: dict[str, list[dict[str, Any]]],
     out_path: Path,
     dpi: int,
 ) -> None:
     sns.set_theme(style="ticks")
-    labels = ["Ours", "KMeans", "Random"]
-    values = [
-        last_eval_loss(ours),
-        last_eval_loss(kmeans),
-        last_eval_loss(random_rows),
-    ]
+    label_map = {
+        "ours": "Ours",
+        "kmeans": "KMeans",
+        "random": "Random",
+        "category": "Category",
+    }
+    color_map = {
+        "ours": "#1f77b4",
+        "kmeans": "#ff7f0e",
+        "random": "#2ca02c",
+        "category": "#d62728",
+    }
+    keys = [k for k in ["ours", "kmeans", "random", "category"] if k in logs]
+    labels = [label_map[k] for k in keys]
+    values = [last_eval_loss(logs[k]) for k in keys]
+    palette = [color_map[k] for k in keys]
 
     plt.figure(figsize=(7.0, 5.0))
-    ax = sns.barplot(x=labels, y=values, palette=["#1f77b4", "#ff7f0e", "#2ca02c"])
+    ax = sns.barplot(x=labels, y=values, palette=palette)
     ax.set_xlabel("Sampling Strategy")
     ax.set_ylabel("Final Eval Loss")
     ax.set_title("Final Performance Comparison")
@@ -198,29 +224,29 @@ def main() -> None:
     )
     ensure_out_dir(args.out_dir)
 
-    ours = load_log_csv(args.ours_log_csv)
-    kmeans = load_log_csv(args.kmeans_log_csv)
-    random_rows = load_log_csv(args.random_log_csv)
+    logs = build_log_map(args)
     radar_scores = load_or_simulate_radar_scores(args.radar_scores_json)
 
     out_curve = args.out_dir / "learning_curves_val_loss.png"
     out_radar = args.out_dir / "data_distribution_radar.png"
     out_bar = args.out_dir / "final_eval_loss_bar.png"
 
-    plot_learning_curves(ours, kmeans, random_rows, out_curve, args.dpi)
+    plot_learning_curves(logs, out_curve, args.dpi)
     plot_radar(radar_scores, out_radar, args.dpi)
-    plot_final_bar(ours, kmeans, random_rows, out_bar, args.dpi)
+    plot_final_bar(logs, out_bar, args.dpi)
 
     summary = {
-        "ours_final_eval_loss": last_eval_loss(ours),
-        "kmeans_final_eval_loss": last_eval_loss(kmeans),
-        "random_final_eval_loss": last_eval_loss(random_rows),
+        "ours_final_eval_loss": last_eval_loss(logs["ours"]),
+        "kmeans_final_eval_loss": last_eval_loss(logs["kmeans"]),
+        "random_final_eval_loss": last_eval_loss(logs["random"]),
         "figures": {
             "learning_curve": str(out_curve),
             "radar": str(out_radar),
             "bar": str(out_bar),
         },
     }
+    if "category" in logs:
+        summary["category_final_eval_loss"] = last_eval_loss(logs["category"])
     with (args.out_dir / "figure_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     logging.info("Visualization done. Outputs in %s", args.out_dir)
