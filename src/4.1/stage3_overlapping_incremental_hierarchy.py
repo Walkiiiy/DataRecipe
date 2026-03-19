@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,8 @@ class Config:
     epsilon: float
     log_every: int
     patience_no_1to2_growth: int
+    shuffle: bool
+    shuffle_seed: int
     log_level: str
 
 
@@ -389,13 +392,20 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="连续多少步没有发生“节点数据量 1->2 增长”则提前收敛；0 表示关闭早停",
     )
+    parser.add_argument(
+        "--shuffle",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否在插入前随机打乱样本顺序（默认开启）。",
+    )
+    parser.add_argument("--shuffle-seed", type=int, default=42, help="随机打乱样本顺序的种子。")
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
 
 
-def stream_rows(path: Path, max_samples: int | None):
+def stream_rows(path: Path, max_samples: int | None, shuffle: bool, shuffle_seed: int):
+    rows: list[tuple[str, str]] = []
     with path.open("r", encoding="utf-8") as f:
-        count = 0
         for idx, line in enumerate(f):
             line = line.strip()
             if not line:
@@ -407,10 +417,17 @@ def stream_rows(path: Path, max_samples: int | None):
                 text = str(row.get("T_description", "")).strip()
             if not text:
                 continue
-            yield data_id, text
-            count += 1
-            if max_samples is not None and count >= max_samples:
-                break
+            rows.append((data_id, text))
+
+    if shuffle:
+        rng = random.Random(shuffle_seed)
+        rng.shuffle(rows)
+
+    if max_samples is not None:
+        rows = rows[:max_samples]
+
+    for item in rows:
+        yield item
 
 
 def main() -> None:
@@ -436,6 +453,8 @@ def main() -> None:
         epsilon=max(1e-12, args.epsilon),
         log_every=max(1, args.log_every),
         patience_no_1to2_growth=max(0, args.patience_no_1to2_growth),
+        shuffle=bool(args.shuffle),
+        shuffle_seed=args.shuffle_seed,
         log_level=args.log_level,
     )
     if not cfg.input_jsonl.exists():
@@ -444,7 +463,9 @@ def main() -> None:
     tree = IncrementalHierarchicalTree(cfg)
     processed = 0
     no_1to2_streak = 0
-    for processed, (data_id, text) in enumerate(stream_rows(cfg.input_jsonl, cfg.max_samples), start=1):
+    for processed, (data_id, text) in enumerate(
+        stream_rows(cfg.input_jsonl, cfg.max_samples, cfg.shuffle, cfg.shuffle_seed), start=1
+    ):
         _created, grew_1_to_2 = tree.insert_one(data_id, text)
         if grew_1_to_2:
             no_1to2_streak = 0

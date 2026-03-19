@@ -1,9 +1,15 @@
-"""4.1 EXP - 三组共享同一验证集的 LoRA 训练脚本。
+"""4.1 EXP - 多数据集共享验证集 LoRA 训练脚本（通用版）。
 
-用途：
-1) 顺序训练 ours / kmeans / random（可选 category）四组实验。
-2) 所有实验共享同一份 eval 数据，保证验证口径一致。
-3) 自动从每个训练集剔除与共享 eval 重叠的样本（按 id，回退 instruction+output）。
+特点：
+1) 不写死对比方法数量与名称；通过可重复参数 --run 动态指定。
+2) 所有 run 共享同一份 eval 数据，保证验证口径一致。
+3) 自动从每个训练集剔除与共享 eval 重叠样本（按 id，回退 instruction+input+output）。
+
+--run 格式：
+  --run <name>::<dataset_jsonl>::<output_dir>
+示例：
+  --run ours::data/dolly-15k/exp/dataset_ours.jsonl::data/dolly-15k/exp/run_ours_shared_eval
+  --run kmeans::data/dolly-15k/exp/dataset_kmeans.jsonl::data/dolly-15k/exp/run_kmeans_shared_eval
 """
 
 from __future__ import annotations
@@ -45,21 +51,12 @@ class MethodJob:
 
 @dataclass
 class TrainConfig:
-    # 数据输入
-    ours_dataset_path: Path
-    kmeans_dataset_path: Path
-    random_dataset_path: Path
-    category_dataset_path: Path | None
-    ours_output_dir: Path
-    kmeans_output_dir: Path
-    random_output_dir: Path
-    category_output_dir: Path | None
+    runs: list[MethodJob]
     shared_eval_jsonl: Path | None
     eval_source_jsonl: Path | None
     eval_ratio: float
     seed: int
     output_root: Path
-    # 模型与训练超参
     base_model: str
     model_source: str
     modelscope_cache_dir: Path | None
@@ -72,25 +69,39 @@ class TrainConfig:
     weight_decay: float
     warmup_ratio: float
     logging_steps: int
-    eval_steps: int
+    eval_steps: int | None
+    eval_steps_mode: str
+    target_eval_count: int
+    min_eval_steps: int
     save_steps: int
     lora_r: int
     lora_alpha: int
     lora_dropout: float
 
 
+def parse_run_item(text: str) -> MethodJob:
+    parts = text.split("::")
+    if len(parts) != 3:
+        raise ValueError(
+            f"Invalid --run format: {text}. Expected <name>::<dataset_jsonl>::<output_dir>"
+        )
+    name = parts[0].strip()
+    dataset_path = Path(parts[1].strip())
+    output_dir = Path(parts[2].strip())
+    if not name:
+        raise ValueError(f"Invalid --run name: {text}")
+    return MethodJob(name=name, dataset_path=dataset_path, output_dir=output_dir)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train multiple LoRA runs with one shared eval set")
-    parser.add_argument("--ours-dataset-path", type=Path, required=True)
-    parser.add_argument("--kmeans-dataset-path", type=Path, required=True)
-    parser.add_argument("--random-dataset-path", type=Path, required=True)
-    parser.add_argument("--category-dataset-path", type=Path, default=None)
-
-    parser.add_argument("--ours-output-dir", type=Path, required=True)
-    parser.add_argument("--kmeans-output-dir", type=Path, required=True)
-    parser.add_argument("--random-output-dir", type=Path, required=True)
-    parser.add_argument("--category-output-dir", type=Path, default=None)
-
+    parser.add_argument(
+        "--run",
+        type=str,
+        action="append",
+        required=True,
+        help="可重复参数：<name>::<dataset_jsonl>::<output_dir>",
+    )
     parser.add_argument(
         "--shared-eval-jsonl",
         type=Path,
@@ -105,9 +116,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--eval-ratio", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-root", type=Path, default=Path("data/alpaca-gpt4-data-en/exp/shared_eval_runs"))
-
-    parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-1.5B")
+    parser.add_argument("--output-root", type=Path, default=Path("data/exp/shared_eval_runs"))
+    parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--model_source", type=str, choices=["modelscope", "hf"], default="modelscope")
     parser.add_argument("--modelscope_cache_dir", type=Path, default=None)
     parser.add_argument("--max_seq_length", type=int, default=1024)
@@ -119,7 +129,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=None,
+        help="手动指定 eval 间隔步数；若不传则按数据集大小自动计算。",
+    )
+    parser.add_argument(
+        "--eval-steps-mode",
+        type=str,
+        choices=["auto", "manual"],
+        default="auto",
+        help="eval_steps 模式：auto=按数据集规模自动计算；manual=使用 --eval_steps。",
+    )
+    parser.add_argument(
+        "--target-eval-count",
+        type=int,
+        default=6,
+        help="auto 模式下，目标评估次数（全训练过程）。",
+    )
+    parser.add_argument(
+        "--min-eval-steps",
+        type=int,
+        default=10,
+        help="auto 模式下 eval_steps 的最小值。",
+    )
     parser.add_argument("--save_steps", type=int, default=100)
     parser.add_argument("--lora_r", type=int, default=8)
     parser.add_argument("--lora_alpha", type=int, default=16)
@@ -153,7 +187,6 @@ def sample_id(row: dict[str, Any], fallback_idx: int) -> str | None:
     sid = row.get("id", None)
     if sid is not None and str(sid) != "":
         return str(sid)
-    # 无 id 时回退到 index 仅用于日志，不参与跨集匹配
     _ = fallback_idx
     return None
 
@@ -317,7 +350,7 @@ def build_training_args(cfg: TrainConfig, output_dir: Path) -> TrainingArguments
         "weight_decay": cfg.weight_decay,
         "warmup_ratio": cfg.warmup_ratio,
         "logging_steps": cfg.logging_steps,
-        "eval_steps": cfg.eval_steps,
+        "eval_steps": 1 if cfg.eval_steps is None else cfg.eval_steps,
         "save_steps": cfg.save_steps,
         "save_strategy": "steps",
         "logging_strategy": "steps",
@@ -394,14 +427,28 @@ def train_one_method(
     if len(kept_rows) < 2:
         raise ValueError(f"{job.name} train set too small after removing eval overlap: {len(kept_rows)}")
     train_ds = to_text_dataset(kept_rows)
+    # 按当前 run 的训练集规模自动计算 eval_steps，保证不同规模数据集评估频率可比。
+    if cfg.eval_steps_mode == "manual":
+        if cfg.eval_steps is None:
+            raise ValueError("eval_steps_mode=manual requires --eval_steps.")
+        resolved_eval_steps = max(1, cfg.eval_steps)
+    else:
+        effective_batch = max(1, cfg.train_batch_size * cfg.gradient_accumulation_steps)
+        steps_per_epoch = max(1, (len(train_ds) + effective_batch - 1) // effective_batch)
+        total_steps = max(1, int(round(steps_per_epoch * cfg.num_train_epochs)))
+        target = max(1, cfg.target_eval_count)
+        resolved_eval_steps = max(1, total_steps // target)
+        resolved_eval_steps = max(cfg.min_eval_steps, resolved_eval_steps)
+        resolved_eval_steps = min(resolved_eval_steps, total_steps)
 
     logging.info(
-        "[%s] train_raw=%d, removed_overlap=%d, train_final=%d, eval_shared=%d",
+        "[%s] train_raw=%d, removed_overlap=%d, train_final=%d, eval_shared=%d, eval_steps=%d",
         job.name,
         len(rows),
         removed,
         len(train_ds),
         len(eval_ds),
+        resolved_eval_steps,
     )
 
     model = load_causal_lm(model_path, get_dtype())
@@ -413,7 +460,8 @@ def train_one_method(
         bias="none",
         task_type="CAUSAL_LM",
     )
-    train_args = build_training_args(cfg, job.output_dir)
+    cfg_for_run = TrainConfig(**{**cfg.__dict__, "eval_steps": resolved_eval_steps})
+    train_args = build_training_args(cfg_for_run, job.output_dir)
     trainer = build_sft_trainer(
         model=model,
         tokenizer=tokenizer,
@@ -430,6 +478,7 @@ def train_one_method(
     with (job.output_dir / "final_metrics.json").open("w", encoding="utf-8") as f:
         json.dump(final_metrics, f, ensure_ascii=False, indent=2)
     export_logs(trainer.state.log_history, job.output_dir)
+
     del trainer
     del model
     if torch.cuda.is_available():
@@ -443,8 +492,21 @@ def train_one_method(
         "removed_overlap": removed,
         "train_final_size": len(train_ds),
         "eval_size": len(eval_ds),
+        "resolved_eval_steps": resolved_eval_steps,
         "final_metrics": final_metrics,
     }
+
+
+def parse_runs(run_items: list[str]) -> list[MethodJob]:
+    jobs = [parse_run_item(x) for x in run_items]
+    # if len(jobs) < 2:
+    #     raise ValueError("At least 2 runs are required for comparison.")
+    seen = set()
+    for j in jobs:
+        if j.name in seen:
+            raise ValueError(f"Duplicate run name: {j.name}")
+        seen.add(j.name)
+    return jobs
 
 
 def main() -> None:
@@ -454,15 +516,10 @@ def main() -> None:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
 
+    runs = parse_runs(args.run)
+
     cfg = TrainConfig(
-        ours_dataset_path=args.ours_dataset_path,
-        kmeans_dataset_path=args.kmeans_dataset_path,
-        random_dataset_path=args.random_dataset_path,
-        category_dataset_path=args.category_dataset_path,
-        ours_output_dir=args.ours_output_dir,
-        kmeans_output_dir=args.kmeans_output_dir,
-        random_output_dir=args.random_output_dir,
-        category_output_dir=args.category_output_dir,
+        runs=runs,
         shared_eval_jsonl=args.shared_eval_jsonl,
         eval_source_jsonl=args.eval_source_jsonl,
         eval_ratio=max(1e-4, min(0.5, args.eval_ratio)),
@@ -480,15 +537,15 @@ def main() -> None:
         weight_decay=max(0.0, args.weight_decay),
         warmup_ratio=max(0.0, args.warmup_ratio),
         logging_steps=max(1, args.logging_steps),
-        eval_steps=max(1, args.eval_steps),
+        eval_steps=args.eval_steps,
+        eval_steps_mode=args.eval_steps_mode,
+        target_eval_count=max(1, args.target_eval_count),
+        min_eval_steps=max(1, args.min_eval_steps),
         save_steps=max(1, args.save_steps),
         lora_r=max(1, args.lora_r),
         lora_alpha=max(1, args.lora_alpha),
         lora_dropout=max(0.0, args.lora_dropout),
     )
-
-    if cfg.category_dataset_path is not None and cfg.category_output_dir is None:
-        raise ValueError("When --category-dataset-path is provided, --category-output-dir is required.")
 
     set_seed(cfg.seed)
     cfg.output_root.mkdir(parents=True, exist_ok=True)
@@ -501,14 +558,17 @@ def main() -> None:
         output_root=cfg.output_root,
     )
     eval_ds = to_text_dataset(eval_rows)
+
     eval_id_set = set()
     eval_io_set = set()
-    for i, r in enumerate(eval_rows):
-        sid = sample_id(r, i)
+    for i, row in enumerate(eval_rows):
+        sid = sample_id(row, i)
         if sid is not None:
             eval_id_set.add(sid)
-        eval_io_set.add(sample_io_signature(r))
+        eval_io_set.add(sample_io_signature(row))
+
     logging.info("Shared eval path=%s, size=%d", shared_eval_path, len(eval_ds))
+    logging.info("Runs=%s", [r.name for r in cfg.runs])
 
     model_path = resolve_model_path(cfg.base_model, cfg.model_source, cfg.modelscope_cache_dir)
     logging.info("Model resolved from %s: %s", cfg.model_source, model_path)
@@ -516,16 +576,8 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    jobs = [
-        MethodJob("ours", cfg.ours_dataset_path, cfg.ours_output_dir),
-        MethodJob("kmeans", cfg.kmeans_dataset_path, cfg.kmeans_output_dir),
-        MethodJob("random", cfg.random_dataset_path, cfg.random_output_dir),
-    ]
-    if cfg.category_dataset_path is not None and cfg.category_output_dir is not None:
-        jobs.append(MethodJob("category", cfg.category_dataset_path, cfg.category_output_dir))
-
     summary: list[dict[str, Any]] = []
-    for job in jobs:
+    for job in cfg.runs:
         summary.append(
             train_one_method(
                 cfg=cfg,
@@ -546,6 +598,11 @@ def main() -> None:
                 "eval_size": len(eval_ds),
                 "seed": cfg.seed,
                 "eval_ratio": cfg.eval_ratio,
+                "eval_steps_mode": cfg.eval_steps_mode,
+                "manual_eval_steps": cfg.eval_steps,
+                "target_eval_count": cfg.target_eval_count,
+                "min_eval_steps": cfg.min_eval_steps,
+                "runs": [r.name for r in cfg.runs],
                 "jobs": summary,
             },
             f,
