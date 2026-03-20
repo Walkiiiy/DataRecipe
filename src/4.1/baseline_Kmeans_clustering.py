@@ -77,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--patience",
         type=int,
-        default=3,
+        default=5,
         help="Early-stop when score is below best score for consecutive steps.",
     )
     parser.add_argument(

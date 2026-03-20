@@ -159,7 +159,7 @@ python src/4.1/stage3_overlapping_incremental_hierarchy.py \
 python src/4.1/stage4_prune_singleton_tree.py \
   --input-tree-json data/mmlu/capability_tree_final.json \
   --output-tree-json data/mmlu/capability_tree_final_pruned.json \
-  --output-summary-json data/mmlu/capability_tree_summary_pruned.json \
+  --output-summary-json data/mmlu/capability_tree_summary_pruned.json 
 
 
 - 采样
@@ -168,7 +168,7 @@ python src/4.1/EXP/data_sampling_by_capability_tree.py \
   --profile-jsonl data/mmlu/mmlu_cdt_profile.jsonl \
   --out-dir data/mmlu/exp \
   --min-valid-cluster-size 10 \
-  --random-seed 42 \
+  --random-seed 42 
 
 
 
@@ -206,3 +206,87 @@ python src/4.1/EXP/visualize_results.py \
   --kmeans-log-csv data/mmlu/exp/run_kmeans_shared_eval/train_eval_log.csv \
   --random-log-csv data/mmlu/exp/run_random_shared_eval/train_eval_log.csv \
   --out-dir data/mmlu/exp/figures
+
+
+
+-----------------------------------------
+## dialogsum数据集
+- export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
+  python src/4.1/stage1_atomic_profile.py \
+  --input data/dialogsum/train.jsonl \
+  --output data/dialogsum/dialogsum_cdt_profile.jsonl \
+  --max-samples 10000000 \
+  --concurrency 32 \
+  --model deepseek-chat \
+  --base-url https://api.deepseek.com
+
+
+- 生成能力树：
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/dialogsum/dialogsum_cdt_profile.jsonl \
+  --max-samples 1000000 \
+  --d-max 0.7 \
+  --log-every 100 \
+  --patience-no-1to2-growth 200 \
+  --log-level INFO
+
+
+-python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/dialogsum/capability_tree_final.json \
+  --output-tree-json data/dialogsum/capability_tree_final_pruned.json \
+  --output-summary-json data/dialogsum/capability_tree_summary_pruned.json 
+
+- 采样
+
+-python src/4.1/EXP/data_sampling_by_capability_tree.py \
+  --tree-json data/dialogsum/capability_tree_final_pruned.json \
+  --profile-jsonl data/dialogsum/dialogsum_cdt_profile.jsonl \
+  --out-dir data/dialogsum/exp \
+  --min-valid-cluster-size 10 \
+  --random-seed 42 
+
+
+-python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/dialogsum/train.jsonl \
+  --out-dir data/dialogsum/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 2903 \
+  --random-seed 42
+
+
+  Total categories=8
+
+
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/dialogsum/train.jsonl
+
+- python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/dialogsum/dialogsum_cdt_profile.jsonl \
+  --out-dir data/dialogsum/exp \
+  --budget-n 2903 \
+  --kmeans-k 3
+
+- 统一测试集训练
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/dialogsum/exp/dataset_ours.jsonl::data/dialogsum/exp/run_ours_shared_eval \
+  --run kmeans::data/dialogsum/exp/dataset_kmeans.jsonl::data/dialogsum/exp/run_kmeans_shared_eval \
+  --run random::data/dialogsum/exp/dataset_random.jsonl::data/dialogsum/exp/run_random_shared_eval \
+  --run category::data/dialogsum/exp/dataset_category.jsonl::data/data_ablation_full59K/exp/run_category_shared_eval \
+  --eval-source-jsonl data/dialogsum/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/dialogsum/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
+
+
+- 画图
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/dialogsum/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/dialogsum/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/dialogsum/exp/run_random_shared_eval/train_eval_log.csv \
+  --out-dir data/dialogsum/exp/figures

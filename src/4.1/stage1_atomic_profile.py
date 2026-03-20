@@ -28,14 +28,17 @@ SYSTEM_PROMPT = (
     "Given one sample with instruction, input, and output, generate exactly one English paragraph "
     "named CDT_description (about 30-50 words).\n"
     "The paragraph must be highly abstract and de-entityized (remove concrete names, places, products, IDs).\n"
-    "It must strictly cover three orthogonal dimensions:\n"
+    "It must strictly cover four explicit dimensions:\n"
     "1) Cognition: thinking mode (reasoning, extraction, planning, creativity, etc.)\n"
-    "2) Domain: knowledge area (computer science, physics, daily conversation, etc.)\n"
+    "2) Domain: knowledge area (computer science, physics, medicine, law, daily conversation, etc.)\n"
     "3) Task: operation objective (debugging, summarization, translation, classification, etc.)\n"
+    "4) Topic: the concrete content theme being handled by the task in abstract form\n"
     "Output rules:\n"
     "- Return plain text only, no JSON, no bullets, no markdown.\n"
     "- Keep density high and avoid filler words.\n"
-    "- Keep the three dimensions explicit in one coherent paragraph."
+    "- Keep all four dimensions explicit in one coherent paragraph.\n"
+    "- Task must mention what is being processed and in which domain.\n"
+    "- For summarization tasks, explicitly state what topic is summarized and its domain."
 )
 
 DEFAULT_INPUT = Path("data/alpaca-gpt4-data-en/train.jsonl")
@@ -88,7 +91,8 @@ def sanitize_description(text: str) -> str:
         return (
             "Cognition: structured instruction following with reasoning and information transformation. "
             "Domain: broad open-domain knowledge abstraction. "
-            "Task: produce a concise response aligned to requested constraints and output intent."
+            "Task: produce a concise response aligned to requested constraints and output intent, with explicit content focus. "
+            "Topic: the central content theme of the sample expressed in abstract terms."
         )
     return cleaned
 
@@ -103,7 +107,9 @@ def build_user_prompt(sample: dict[str, Any]) -> str:
         f"Input:\n{input_text}\n\n"
         f"Output:\n{output_text}\n\n"
         "Return only one English paragraph CDT_description (30-50 words), highly abstract, de-entityized, "
-        "and explicitly covering Cognition, Domain, and Task."
+        "and explicitly covering Cognition, Domain, Task, and Topic. "
+        "Task must state what content is being handled and in which domain. "
+        "If the task is summarization, state the summarized topic and domain explicitly."
     )
 
 
@@ -163,7 +169,8 @@ async def request_cdt(
     return (
         "Cognition: generic instruction understanding with basic transformation and response planning. "
         "Domain: mixed open-domain context without fixed specialized grounding. "
-        "Task: generate a concise answer that matches requested format and communicative goal."
+        "Task: generate a concise answer that matches requested format and communicative goal, with explicit content focus. "
+        "Topic: the underlying content theme inferred from the sample context."
     )
 
 
