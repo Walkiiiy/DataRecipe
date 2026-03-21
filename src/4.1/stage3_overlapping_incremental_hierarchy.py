@@ -9,6 +9,7 @@
 说明：
 - 本实现复用 stage2 的 ObjectiveEvaluator，J = sum(Dens * Sep)。
 - data_ids 在叶子节点持有；内部节点通过子树聚合计算 center。
+- 每个节点维护自己的 d_max；根节点由命令行参数初始化。Split 时会将更小的 d_max 下放到子层。
 """
 
 from __future__ import annotations
@@ -44,12 +45,14 @@ class CapabilityNode:
     - center: 簇中心（子树向量均值）
     - data_ids: 叶子节点保存的数据 ID；内部节点一般为空
     - children: 子节点列表
+    - d_max: 当前节点的动态距离阈值
     """
 
     node_id: str
     center: np.ndarray | None = None
     data_ids: list[str] = field(default_factory=list)
     children: list["CapabilityNode"] = field(default_factory=list)
+    d_max: float = 0.0
 
     @property
     def is_leaf(self) -> bool:
@@ -64,7 +67,8 @@ class Config:
     embedding_model: str
     device: str
     max_samples: int | None
-    d_max: float
+    max_layers: int
+    root_d_max: float
     epsilon: float
     log_every: int
     patience_no_1to2_growth: int
@@ -124,7 +128,7 @@ class IncrementalHierarchicalTree:
         self.vectorizer = DenseVectorizer(cfg.embedding_model, cfg.device)
         self.vector_store: dict[str, np.ndarray] = {}
         self.node_seq = 0
-        self.root = self._new_internal_node()
+        self.root = self._new_internal_node(cfg.root_d_max)
         self._grew_1_to_2_in_last_insert = False
 
     # -----------------------------
@@ -135,23 +139,25 @@ class IncrementalHierarchicalTree:
         self.node_seq += 1
         return node_id
 
-    def _new_internal_node(self) -> CapabilityNode:
-        return CapabilityNode(node_id=self._new_node_id(), center=None, data_ids=[], children=[])
+    def _new_internal_node(self, d_max: float) -> CapabilityNode:
+        return CapabilityNode(node_id=self._new_node_id(), center=None, data_ids=[], children=[], d_max=d_max)
 
-    def _new_leaf_node(self, data_id: str) -> CapabilityNode:
+    def _new_leaf_node(self, data_id: str, d_max: float) -> CapabilityNode:
         return CapabilityNode(
             node_id=self._new_node_id(),
             center=self.vector_store[data_id].copy(),
             data_ids=[data_id],
             children=[],
+            d_max=d_max,
         )
 
-    def _new_leaf_from_ids(self, ids: list[str]) -> CapabilityNode:
+    def _new_leaf_from_ids(self, ids: list[str], d_max: float) -> CapabilityNode:
         leaf = CapabilityNode(
             node_id=self._new_node_id(),
             center=None,
             data_ids=list(dict.fromkeys(ids)),
             children=[],
+            d_max=d_max,
         )
         self._refresh_center(leaf)
         return leaf
@@ -177,6 +183,18 @@ class IncrementalHierarchicalTree:
         """沿路径自底向上刷新中心。path[-1] 是当前节点。"""
         for node in reversed(path):
             self._refresh_center(node)
+
+    def _subtree_depth_edges(self, node: CapabilityNode) -> int:
+        """返回子树深度（边数）：叶子为 0。"""
+        if not node.children:
+            return 0
+        return 1 + max(self._subtree_depth_edges(c) for c in node.children)
+
+    def _cap_subtree_d_max(self, node: CapabilityNode, upper_bound: float) -> None:
+        """将子树中各节点 d_max 限制在给定上界内，维持由上到下的阈值递减。"""
+        node.d_max = min(node.d_max, upper_bound)
+        for child in node.children:
+            self._cap_subtree_d_max(child, node.d_max)
 
     # -----------------------------
     # J 计算辅助函数
@@ -225,7 +243,7 @@ class IncrementalHierarchicalTree:
         # 2) 非 root 叶子：直接吸收 data_id（叶子簇内合并），不再无限下挂新叶
         if node.is_leaf:
             if node is self.root:
-                node.children.append(self._new_leaf_node(data_id))
+                node.children.append(self._new_leaf_node(data_id, d_max=node.d_max))
             else:
                 before = len(node.data_ids)
                 if data_id not in node.data_ids:
@@ -248,9 +266,17 @@ class IncrementalHierarchicalTree:
         nearest_idx = int(np.argmin(np.asarray(dists)))
         d_min = dists[nearest_idx]
         nearest = node.children[nearest_idx]
+
+        # 到达最底层后，只允许并入最近分支，不再 Create New / Split。
+        current_layer = len(path)  # root = 1
+        if current_layer >= self.cfg.max_layers:
+            self.insert(nearest, vector, data_id, path + [nearest])
+            self._refresh_center_upward(path)
+            return
+
         # 状态 1: Create New（距离过远）
-        if d_min >= self.cfg.d_max:
-            node.children.append(self._new_leaf_node(data_id))
+        if d_min >= node.d_max:
+            node.children.append(self._new_leaf_node(data_id, d_max=node.d_max))
             self._refresh_center_upward(path)
             return
 
@@ -264,9 +290,24 @@ class IncrementalHierarchicalTree:
             self._refresh_center_upward(path)
             return
 
+        # 在 max_layers-1 层禁止 Split（否则会把原子树整体下压到 max_layers+1）。
+        if current_layer >= self.cfg.max_layers - 1:
+            self.insert(nearest, vector, data_id, path + [nearest])
+            self._refresh_center_upward(path)
+            return
+
+        # 即使当前层不深，Split 也会把 nearest 整棵子树下压一层；若会突破全局层数上限则禁用 Split。
+        nearest_subtree_depth = self._subtree_depth_edges(nearest)
+        if current_layer + 2 + nearest_subtree_depth > self.cfg.max_layers:
+            self.insert(nearest, vector, data_id, path + [nearest])
+            self._refresh_center_upward(path)
+            return
+
         # 状态 3: Split（J 下降）-> 创建中间父节点 P_new，替换最近 child。
-        p_new = self._new_internal_node()
-        new_leaf = self._new_leaf_node(data_id)
+        split_d_max = min(node.d_max, max(d_min, self.cfg.epsilon))
+        p_new = self._new_internal_node(split_d_max)
+        new_leaf = self._new_leaf_node(data_id, d_max=split_d_max)
+        self._cap_subtree_d_max(nearest, split_d_max)
         p_new.children = [nearest, new_leaf]
         self._refresh_center(p_new)
         node.children[nearest_idx] = p_new
@@ -331,13 +372,14 @@ class IncrementalHierarchicalTree:
         connector = "└── " if is_last else "├── "
         center_norm = float(np.linalg.norm(node.center)) if node.center is not None else 0.0
         logging.info(
-            "%s%s%s [subtree_size=%d, leaf_payload=%d, children=%d, |center|=%.4f]",
+            "%s%s%s [subtree_size=%d, leaf_payload=%d, children=%d, d_max=%.6f, |center|=%.4f]",
             prefix,
             connector,
             node.node_id,
             self._subtree_size(node),
             len(node.data_ids),
             len(node.children),
+            node.d_max,
             center_norm,
         )
 
@@ -355,6 +397,7 @@ class IncrementalHierarchicalTree:
             "subtree_size": self._subtree_size(node),
             "leaf_payload_size": len(node.data_ids),
             "children_count": len(node.children),
+            "d_max": node.d_max,
             "center_norm": float(np.linalg.norm(node.center)) if node.center is not None else 0.0,
             "data_ids": list(node.data_ids),
             "children": [self.export_tree_dict(c) for c in node.children],
@@ -383,7 +426,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-samples", type=int, default=1000, help="-1 for full dataset")
-    parser.add_argument("--d-max", type=float, default=0.35, help="基础相关性阈值 D_max")
+    parser.add_argument("--max-layers", type=int, default=30, help="能力树最大层数（root=1）；最底层仅允许 Merge。")
+    parser.add_argument(
+        "--root-d-max",
+        "--d-max",
+        dest="root_d_max",
+        type=float,
+        default=0.35,
+        help="根节点初始相关性阈值 D_max；后续节点在 split 过程中动态收缩。",
+    )
     parser.add_argument("--epsilon", type=float, default=1e-5)
     parser.add_argument("--log-every", type=int, default=100, help="每处理多少条打印一次阶段快照")
     parser.add_argument(
@@ -449,7 +500,8 @@ def main() -> None:
         embedding_model=args.embedding_model,
         device=args.device,
         max_samples=max_samples,
-        d_max=max(1e-8, args.d_max),
+        max_layers=max(1, args.max_layers),
+        root_d_max=max(1e-8, args.root_d_max),
         epsilon=max(1e-12, args.epsilon),
         log_every=max(1, args.log_every),
         patience_no_1to2_growth=max(0, args.patience_no_1to2_growth),
@@ -505,6 +557,8 @@ def main() -> None:
         "depth": tree.depth(),
         "level_counts": tree.level_counts(),
         "global_J": tree.global_j(),
+        "max_layers": cfg.max_layers,
+        "root_d_max": cfg.root_d_max,
         "patience_no_1to2_growth": cfg.patience_no_1to2_growth,
         "final_no_1to2_streak": no_1to2_streak,
         "converged_early": bool(
