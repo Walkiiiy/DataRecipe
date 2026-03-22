@@ -1,16 +1,14 @@
-"""4.1 EXP - 能力树采样（v2：保留 tree core + 低噪扩展）。
+"""4.1 EXP - 能力树采样（v5：仅用树内数据 + 按树内比例采样）。
 
 设计目标：
-1) 有效簇（size > min_valid_cluster_size）中的 tree 样本全部保留。
-2) 如需补充预算，使用 CDT_description 嵌入做“最近簇单分配”扩展：
-   - 每个有效簇中心由其 tree core 计算；
-   - 半径阈值使用簇内距离分位数（默认 P90），而非 max，降低离群点放大效应；
-   - 每个树外样本最多归入一个最近簇，避免多簇重复吸入。
-3) 扩展优先做簇间平衡补充，不足时按全局最近继续补齐，确保达到预算。
+1) 仅使用能力树自身携带的 data_ids 作为候选池；
+2) 若树内候选总量小于预算 N，直接报错；
+3) 按树内分组（节点 data_ids）大小比例分配配额并采样；
+4) 输出 dataset_ours.jsonl 与采样统计 meta。
 
 输出：
 - dataset_ours.jsonl
-- sampling_meta_ours_tree_v2.json
+- sampling_meta_ours_tree_v3.json
 """
 
 from __future__ import annotations
@@ -39,7 +37,12 @@ class SamplingConfig:
     profile_jsonl: Path
     out_dir: Path
     min_valid_cluster_size: int
-    budget_n: int | None
+    budget_n: int
+    assignment_distance_quantile: float
+    assignment_distance_scale: float
+    near_ratio: float
+    min_level_quota: int
+    # Deprecated args kept for backward compatibility in CLI.
     radius_quantile: float
     radius_scale: float
     allow_loose_fill: bool
@@ -49,7 +52,7 @@ class SamplingConfig:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Capability-tree sampling v2 (keep core + low-noise expansion)")
+    parser = argparse.ArgumentParser(description="Capability-tree sampling v5 (tree-only proportional)")
     parser.add_argument(
         "--tree-json",
         type=Path,
@@ -67,30 +70,55 @@ def parse_args() -> argparse.Namespace:
         "--min-valid-cluster-size",
         type=int,
         default=10,
-        help="有效簇最小样本数阈值（严格大于该值）。",
+        help="有效叶簇最小样本数阈值（严格大于该值）。",
     )
     parser.add_argument(
         "--budget-n",
         type=int,
-        default=None,
-        help="目标预算 N。默认等于有效簇 tree core 的去重总量（全部保留）。",
+        required=True,
+        help="统一采样预算 N（与 kmeans/random 对齐，必填）。",
     )
+    parser.add_argument(
+        "--assignment-distance-quantile",
+        type=float,
+        default=0.99,
+        help="样本到最近叶簇中心距离的分位数门限（<1 时启用过滤）。",
+    )
+    parser.add_argument(
+        "--assignment-distance-scale",
+        type=float,
+        default=1.0,
+        help="距离门限缩放系数，threshold = quantile * scale。",
+    )
+    parser.add_argument(
+        "--near-ratio",
+        type=float,
+        default=0.7,
+        help="簇内近心样本比例（其余为边界/困难样本）。范围 [0,1]。",
+    )
+    parser.add_argument(
+        "--min-level-quota",
+        type=int,
+        default=1,
+        help="每个有容量层的最小保底配额。",
+    )
+    # Deprecated args (v3 不使用，但保留参数兼容旧命令行)
     parser.add_argument(
         "--radius-quantile",
         type=float,
         default=0.9,
-        help="扩展阈值半径分位数 q（0<q<=1），默认 0.9 对应 P90。",
+        help="[Deprecated in v3] 保留兼容，无实际作用。",
     )
     parser.add_argument(
         "--radius-scale",
         type=float,
         default=1.0,
-        help="半径缩放系数（>0）。",
+        help="[Deprecated in v3] 保留兼容，无实际作用。",
     )
     parser.add_argument(
         "--allow-loose-fill",
         action="store_true",
-        help="严格阈值候选不足时，允许按全局最近距离继续补齐。",
+        help="[Deprecated in v3] 保留兼容，无实际作用。",
     )
     parser.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--device", type=str, default="auto", help="auto/cpu/cuda")
@@ -129,30 +157,36 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def iter_leaf_nodes(tree: dict[str, Any]) -> list[dict[str, Any]]:
-    leaves: list[dict[str, Any]] = []
+def iter_leaf_nodes_with_depth(tree: dict[str, Any]) -> list[tuple[dict[str, Any], int]]:
+    leaves: list[tuple[dict[str, Any], int]] = []
 
-    def _walk(node: dict[str, Any]) -> None:
+    def _walk(node: dict[str, Any], depth: int) -> None:
         children = node.get("children", [])
         if not children:
-            leaves.append(node)
+            leaves.append((node, depth))
             return
         for child in children:
-            _walk(child)
+            _walk(child, depth + 1)
 
-    _walk(tree)
+    _walk(tree, 0)
     return leaves
 
 
-def collect_valid_clusters(tree: dict[str, Any], min_valid_cluster_size: int) -> list[list[str]]:
-    leaves = iter_leaf_nodes(tree)
-    valid: list[list[str]] = []
-    for leaf in leaves:
+def collect_valid_leaf_specs(tree: dict[str, Any], min_valid_cluster_size: int) -> list[dict[str, Any]]:
+    leaf_pairs = iter_leaf_nodes_with_depth(tree)
+    specs: list[dict[str, Any]] = []
+    for leaf, depth in leaf_pairs:
         ids = [str(x) for x in leaf.get("data_ids", [])]
         ids = list(dict.fromkeys(ids))
         if len(ids) > min_valid_cluster_size:
-            valid.append(ids)
-    return valid
+            specs.append(
+                {
+                    "node_id": str(leaf.get("node_id", f"LEAF_{len(specs)}")),
+                    "depth": int(depth),
+                    "core_ids": ids,
+                }
+            )
+    return specs
 
 
 def build_embeddings(rows: list[dict[str, Any]], model_name: str, device: str) -> np.ndarray:
@@ -177,6 +211,175 @@ def write_subset_jsonl(rows_by_id: dict[str, dict[str, Any]], picked_ids: list[s
             f.write(json.dumps(rows_by_id[rid], ensure_ascii=False) + "\n")
 
 
+def collect_tree_sampling_groups(tree: dict[str, Any]) -> tuple[list[dict[str, Any]], set[str]]:
+    """从能力树收集采样分组（仅基于树自身 data_ids）。
+
+    规则：
+    - 每个节点自身的 data_ids 作为一个分组；
+    - 采用 DFS 遍历；
+    - 全局去重：同一个 id 仅归属到首次遇到的分组，避免重复采样。
+    """
+    groups: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+
+    def _walk(node: dict[str, Any], depth: int) -> None:
+        node_id = str(node.get("node_id", f"N_DEPTH_{depth}"))
+        raw_ids = [str(x) for x in node.get("data_ids", [])]
+        unique_ids: list[str] = []
+        for rid in raw_ids:
+            if rid not in used_ids:
+                used_ids.add(rid)
+                unique_ids.append(rid)
+        if unique_ids:
+            groups.append(
+                {
+                    "group_id": node_id,
+                    "depth": int(depth),
+                    "ids": unique_ids,
+                }
+            )
+        for child in node.get("children", []) or []:
+            _walk(child, depth + 1)
+
+    _walk(tree, 0)
+    return groups, used_ids
+
+
+def allocate_group_quotas_by_size(group_sizes: list[int], budget_n: int) -> list[int]:
+    """按组大小比例分配预算（Hamilton 最大余数法）。"""
+    total = int(sum(group_sizes))
+    if total <= 0:
+        return [0] * len(group_sizes)
+
+    # 理论配额 -> 向下取整
+    exact = [budget_n * s / total for s in group_sizes]
+    quotas = [min(int(x), group_sizes[i]) for i, x in enumerate(exact)]
+
+    remain = int(budget_n - sum(quotas))
+    remainders = sorted(
+        [(exact[i] - int(exact[i]), i) for i in range(len(group_sizes))],
+        key=lambda x: x[0],
+        reverse=True,
+    )
+    while remain > 0:
+        progressed = False
+        for _, idx in remainders:
+            if quotas[idx] < group_sizes[idx]:
+                quotas[idx] += 1
+                remain -= 1
+                progressed = True
+                if remain == 0:
+                    break
+        if not progressed:
+            break
+    return quotas
+
+
+def allocate_level_quotas_by_capacity(
+    levels: list[int],
+    level_capacities: dict[int, int],
+    budget_n: int,
+    min_level_quota: int,
+) -> dict[int, int]:
+    """按层容量比例分配预算，并支持每层最小保底。"""
+    quotas = {lv: 0 for lv in levels}
+    if not levels or budget_n <= 0:
+        return quotas
+
+    active_levels = [lv for lv in levels if level_capacities.get(lv, 0) > 0]
+    if not active_levels:
+        return quotas
+
+    remain_budget = int(budget_n)
+
+    # 先给每个有容量层最小保底，避免深层被完全饿死。
+    if min_level_quota > 0:
+        for lv in active_levels:
+            if remain_budget <= 0:
+                break
+            give = min(int(min_level_quota), int(level_capacities[lv]), remain_budget)
+            quotas[lv] += give
+            remain_budget -= give
+
+    residual_caps = {lv: max(0, int(level_capacities[lv] - quotas[lv])) for lv in active_levels}
+    total_residual_cap = sum(residual_caps.values())
+    if remain_budget <= 0 or total_residual_cap <= 0:
+        return quotas
+
+    # 再按剩余容量比例分配剩余预算。
+    base_added: dict[int, int] = {}
+    frac_parts: list[tuple[float, int]] = []
+    for lv in active_levels:
+        cap = residual_caps[lv]
+        if cap <= 0:
+            base_added[lv] = 0
+            continue
+        exact = remain_budget * cap / total_residual_cap
+        base = min(int(exact), cap)
+        base_added[lv] = base
+        frac_parts.append((exact - base, lv))
+
+    used = sum(base_added.values())
+    for lv, add in base_added.items():
+        quotas[lv] += add
+    leftover = remain_budget - used
+
+    # 最后用小数部分从大到小补齐剩余名额（同时受容量上限约束）。
+    frac_parts.sort(reverse=True, key=lambda x: x[0])
+    while leftover > 0:
+        progressed = False
+        for _, lv in frac_parts:
+            if quotas[lv] < level_capacities[lv]:
+                quotas[lv] += 1
+                leftover -= 1
+                progressed = True
+                if leftover == 0:
+                    break
+        if not progressed:
+            break
+    return quotas
+
+
+def build_mixed_queue(pairs_sorted_asc: list[tuple[str, float]], near_ratio: float) -> list[str]:
+    """将单簇样本按“近心 + 边界”混合成可顺序抽取队列。
+
+    - near_ratio=1: 纯近心优先；
+    - near_ratio=0: 纯边界优先；
+    - 中间值：按近/远交替近似比例混合。
+    """
+    if not pairs_sorted_asc:
+        return []
+    if near_ratio >= 1.0:
+        return [rid for rid, _ in pairs_sorted_asc]
+    if near_ratio <= 0.0:
+        return [rid for rid, _ in reversed(pairs_sorted_asc)]
+
+    n = len(pairs_sorted_asc)
+    near_count = max(1, min(n, int(round(n * near_ratio))))
+    near_part = pairs_sorted_asc[:near_count]
+    far_part = list(reversed(pairs_sorted_asc[near_count:]))  # 边界样本：距离更远优先
+
+    near_per_far = max(1, int(round(near_ratio / max(1e-6, 1.0 - near_ratio))))
+    out: list[str] = []
+    i = 0
+    j = 0
+    while i < len(near_part) or j < len(far_part):
+        for _ in range(near_per_far):
+            if i < len(near_part):
+                out.append(near_part[i][0])
+                i += 1
+        if j < len(far_part):
+            out.append(far_part[j][0])
+            j += 1
+        if i >= len(near_part) and j < len(far_part):
+            out.extend([rid for rid, _ in far_part[j:]])
+            break
+        if j >= len(far_part) and i < len(near_part):
+            out.extend([rid for rid, _ in near_part[i:]])
+            break
+    return out
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(
@@ -189,7 +392,11 @@ def main() -> None:
         profile_jsonl=args.profile_jsonl,
         out_dir=args.out_dir,
         min_valid_cluster_size=max(0, args.min_valid_cluster_size),
-        budget_n=args.budget_n,
+        budget_n=max(1, int(args.budget_n)),
+        assignment_distance_quantile=min(1.0, max(0.0, float(args.assignment_distance_quantile))),
+        assignment_distance_scale=max(1e-8, float(args.assignment_distance_scale)),
+        near_ratio=min(1.0, max(0.0, float(args.near_ratio))),
+        min_level_quota=max(0, int(args.min_level_quota)),
         radius_quantile=min(1.0, max(1e-6, float(args.radius_quantile))),
         radius_scale=max(1e-6, float(args.radius_scale)),
         allow_loose_fill=bool(args.allow_loose_fill),
@@ -206,191 +413,120 @@ def main() -> None:
         raise FileNotFoundError(f"Profile jsonl not found: {cfg.profile_jsonl}")
 
     tree = load_json(cfg.tree_json)
-    rows = load_jsonl(cfg.profile_jsonl)
-    if not rows:
+    rows_raw = load_jsonl(cfg.profile_jsonl)
+    if not rows_raw:
         raise ValueError("Profile JSONL is empty.")
 
+    # 建立唯一 ID 索引（后者覆盖前者）。
     rows_by_id: dict[str, dict[str, Any]] = {}
-    row_ids_in_order: list[str] = []
-    for i, row in enumerate(rows):
+    for i, row in enumerate(rows_raw):
         rid = str(row.get("id", i))
         if rid in rows_by_id:
             logging.warning("Duplicate sample id found: %s; overwrite with later row.", rid)
         rows_by_id[rid] = row
-        row_ids_in_order.append(rid)
-    all_ids = list(rows_by_id.keys())
 
-    valid_clusters = collect_valid_clusters(tree, cfg.min_valid_cluster_size)
-    valid_clusters = [[sid for sid in c if sid in rows_by_id] for c in valid_clusters]
-    valid_clusters = [c for c in valid_clusters if c]
-    if not valid_clusters:
-        raise ValueError("No valid clusters found. Please check tree quality or lower min_valid_cluster_size.")
+    # 新策略：仅使用能力树自身数据作为采样池（不再从全量 profile 做最近簇重分配）。
+    groups_raw, tree_ids_unique = collect_tree_sampling_groups(tree)
+    if not groups_raw:
+        raise ValueError("No data_ids found in tree. Cannot sample from tree itself.")
 
-    k = len(valid_clusters)
-    core_ids = set(sid for c in valid_clusters for sid in c)
-    core_ids_in_order = [rid for rid in row_ids_in_order if rid in core_ids]
-    core_n = len(core_ids_in_order)
-
-    budget_n = core_n if cfg.budget_n is None else int(cfg.budget_n)
-    if budget_n < core_n:
-        raise ValueError(f"budget_n={budget_n} < core_n={core_n}. v2 策略要求保留全部 tree core。")
-    if budget_n > len(all_ids):
-        raise ValueError(f"Budget N={budget_n} exceeds dataset size={len(all_ids)}.")
-
-    extra_needed = budget_n - core_n
-    logging.info(
-        "Valid clusters=%d, core_n=%d, budget_n=%d, extra_needed=%d",
-        k,
-        core_n,
-        budget_n,
-        extra_needed,
-    )
-
-    selected_extra: list[str] = []
-    strict_selected_n = 0
-    loose_selected_n = 0
-    fallback_random_n = 0
-    radius_stats: dict[str, float] = {}
-
-    if extra_needed > 0:
-        vectors = build_embeddings(rows, cfg.embedding_model, cfg.device)
-        id_to_index = {rid: i for i, rid in enumerate(row_ids_in_order)}
-
-        # 每个有效簇：center + quantile radius
-        centers: list[np.ndarray] = []
-        radii: list[float] = []
-        cluster_sizes: list[int] = []
-        for c in valid_clusters:
-            member_ids = [sid for sid in c if sid in id_to_index]
-            member_vecs = vectors[[id_to_index[sid] for sid in member_ids]]
-            center = member_vecs.mean(axis=0)
-            dist = np.linalg.norm(member_vecs - center, axis=1)
-            radius_q = float(np.quantile(dist, cfg.radius_quantile)) if len(dist) > 0 else 0.0
-            radius = max(radius_q * cfg.radius_scale, 1e-8)
-            centers.append(center.astype(np.float32))
-            radii.append(radius)
-            cluster_sizes.append(len(member_ids))
-
-        centers_arr = np.stack(centers, axis=0)
-        radii_arr = np.asarray(radii, dtype=np.float32)
-
-        radius_stats = {
-            "min": float(radii_arr.min()),
-            "mean": float(radii_arr.mean()),
-            "max": float(radii_arr.max()),
-        }
-
-        # 树外样本 -> 最近簇单分配
-        core_set = set(core_ids_in_order)
-        non_tree_ids = [rid for rid in row_ids_in_order if rid not in core_set]
-
-        strict_candidates_by_cluster: list[list[tuple[float, str]]] = [[] for _ in range(k)]
-        global_candidates: list[tuple[float, str, int]] = []  # (normalized_dist, rid, cluster_idx)
-        for rid in non_tree_ids:
-            vec = vectors[id_to_index[rid]]
-            dist = np.linalg.norm(centers_arr - vec, axis=1)
-            best_idx = int(dist.argmin())
-            best_dist = float(dist[best_idx])
-            norm_dist = best_dist / float(radii_arr[best_idx])
-            global_candidates.append((norm_dist, rid, best_idx))
-            if best_dist <= float(radii_arr[best_idx]):
-                strict_candidates_by_cluster[best_idx].append((best_dist, rid))
-
-        for arr in strict_candidates_by_cluster:
-            arr.sort(key=lambda x: x[0])
-        global_candidates.sort(key=lambda x: x[0])
-
-        # 平衡补充：优先给当前规模较小簇补入最近样本
-        selected_set: set[str] = set()
-        cursor = [0] * k
-        selected_count_by_cluster = [0] * k
-        remaining = extra_needed
-        while remaining > 0:
-            progress = False
-            order = sorted(
-                range(k),
-                key=lambda i: cluster_sizes[i] + selected_count_by_cluster[i],
+    groups: list[dict[str, Any]] = []
+    missing_in_profile_count = 0
+    for g in groups_raw:
+        ids_in_profile = [rid for rid in g["ids"] if rid in rows_by_id]
+        missing_in_profile_count += len(g["ids"]) - len(ids_in_profile)
+        if ids_in_profile:
+            groups.append(
+                {
+                    "group_id": g["group_id"],
+                    "depth": g["depth"],
+                    "ids": ids_in_profile,
+                }
             )
-            for ci in order:
-                arr = strict_candidates_by_cluster[ci]
-                p = cursor[ci]
-                while p < len(arr) and arr[p][1] in selected_set:
-                    p += 1
-                cursor[ci] = p
-                if p >= len(arr):
-                    continue
-                rid = arr[p][1]
-                selected_set.add(rid)
-                selected_count_by_cluster[ci] += 1
-                cursor[ci] += 1
-                remaining -= 1
-                progress = True
-                if remaining == 0:
-                    break
-            if not progress:
-                break
-        strict_selected_n = len(selected_set)
 
-        # 允许放宽时，按全局最近继续补齐
-        if remaining > 0 and cfg.allow_loose_fill:
-            for _, rid, ci in global_candidates:
-                if rid in selected_set:
-                    continue
-                selected_set.add(rid)
-                selected_count_by_cluster[ci] += 1
-                remaining -= 1
-                if remaining == 0:
-                    break
-            loose_selected_n = len(selected_set) - strict_selected_n
+    if not groups:
+        raise ValueError("All tree ids are missing in profile jsonl. Cannot write sampled dataset.")
 
-        # 最终兜底：随机补齐
-        if remaining > 0:
-            remain_pool = [rid for rid in non_tree_ids if rid not in selected_set]
-            if remaining > len(remain_pool):
-                raise RuntimeError(
-                    f"Cannot fill budget: remaining={remaining}, remain_pool={len(remain_pool)}"
-                )
-            picks = rng.sample(remain_pool, remaining)
-            selected_set.update(picks)
-            fallback_random_n = len(picks)
-            remaining = 0
+    group_sizes = [len(g["ids"]) for g in groups]
+    candidate_count = int(sum(group_sizes))
+    if cfg.budget_n > candidate_count:
+        raise ValueError(
+            f"Tree candidate size={candidate_count} is smaller than budget_n={cfg.budget_n}. "
+            "Please lower budget or rebuild tree with more samples."
+        )
 
-        selected_extra = list(selected_set)
-        rng.shuffle(selected_extra)
+    quotas = allocate_group_quotas_by_size(group_sizes, cfg.budget_n)
+    picked: list[str] = []
+    selected_per_group: list[int] = []
+    for i, g in enumerate(groups):
+        q = int(quotas[i])
+        if q <= 0:
+            selected_per_group.append(0)
+            continue
+        chosen = rng.sample(g["ids"], q)
+        picked.extend(chosen)
+        selected_per_group.append(len(chosen))
 
-    picked = core_ids_in_order + selected_extra
-    if len(picked) != budget_n:
-        raise RuntimeError(f"Final picked size mismatch: got={len(picked)} expected={budget_n}")
+    # 理论上 Hamilton 配额应达到预算；此处做健壮性补齐。
+    picked = list(dict.fromkeys(picked))
+    if len(picked) < cfg.budget_n:
+        remain_pool = [rid for g in groups for rid in g["ids"] if rid not in set(picked)]
+        need = cfg.budget_n - len(picked)
+        if need > len(remain_pool):
+            raise RuntimeError(
+                f"Not enough remaining ids for fill: need={need}, remain_pool={len(remain_pool)}"
+            )
+        logging.warning(
+            "Proportional allocation underfilled by %d; fallback global fill from tree pool.",
+            need,
+        )
+        picked.extend(rng.sample(remain_pool, need))
 
-    # 打散顺序，降低原始文件顺序偏置
+    if len(picked) > cfg.budget_n:
+        picked = rng.sample(picked, cfg.budget_n)
+
+    if len(picked) != cfg.budget_n:
+        raise RuntimeError(f"Final picked size mismatch: got={len(picked)} expected={cfg.budget_n}")
+    if len(set(picked)) != len(picked):
+        raise RuntimeError("Picked ids contain duplicates, which should not happen.")
+
     rng.shuffle(picked)
 
     out_ours = cfg.out_dir / "dataset_ours.jsonl"
     write_subset_jsonl(rows_by_id, picked, out_ours)
 
+    groups_by_depth: dict[int, int] = {}
+    selected_by_depth: dict[int, int] = {}
+    for i, g in enumerate(groups):
+        d = int(g["depth"])
+        groups_by_depth[d] = groups_by_depth.get(d, 0) + 1
+        selected_by_depth[d] = selected_by_depth.get(d, 0) + int(selected_per_group[i])
+
     meta = {
-        "strategy": "tree_core_keep_all_v2",
-        "min_valid_cluster_size": cfg.min_valid_cluster_size,
-        "effective_cluster_count": k,
-        "core_n": core_n,
-        "budget_n": budget_n,
-        "extra_needed": extra_needed,
-        "radius_quantile": cfg.radius_quantile,
-        "radius_scale": cfg.radius_scale,
-        "allow_loose_fill": cfg.allow_loose_fill,
-        "radius_stats": radius_stats,
-        "strict_selected_n": strict_selected_n,
-        "loose_selected_n": loose_selected_n,
-        "fallback_random_n": fallback_random_n,
+        "strategy": "tree_internal_ids_proportional_sampling_v5",
+        "budget_n": cfg.budget_n,
+        "tree_unique_ids_count": len(tree_ids_unique),
+        "candidate_count_in_profile": candidate_count,
+        "missing_in_profile_count": missing_in_profile_count,
+        "group_count": len(groups),
+        "group_count_by_depth": dict(sorted(groups_by_depth.items(), key=lambda kv: kv[0])),
+        "selected_count_by_depth": dict(sorted(selected_by_depth.items(), key=lambda kv: kv[0])),
+        "group_size_min": int(min(group_sizes)),
+        "group_size_mean": float(np.mean(group_sizes)),
+        "group_size_max": int(max(group_sizes)),
+        "selected_per_group_min": int(min(selected_per_group)),
+        "selected_per_group_mean": float(np.mean(selected_per_group)),
+        "selected_per_group_max": int(max(selected_per_group)),
         "random_seed": cfg.random_seed,
         "output": {"ours": str(out_ours)},
     }
+
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
-    meta_path = cfg.out_dir / "sampling_meta_ours_tree_v2.json"
+    meta_path = cfg.out_dir / "sampling_meta_ours_tree_v3.json"
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
-    logging.info("Tree sampling v2 completed. Meta saved to %s", meta_path)
+    logging.info("Tree sampling v5 completed (tree-only proportional). Meta saved to %s", meta_path)
 
 
 if __name__ == "__main__":

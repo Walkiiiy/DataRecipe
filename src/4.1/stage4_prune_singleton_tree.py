@@ -4,6 +4,7 @@
 - stage3 产出的 capability_tree_final.json
 
 处理规则：
+0) 预处理：若某节点所有直接子树的数据量都 < 5，则先将这些子树合并到该节点。
 1) 自底向上删除“叶子且仅 1 条数据”的簇。
 2) 若删除后父节点仅剩 1 个子节点，则执行“子替父”折叠。
 3) 重新计算 subtree_size / children_count / leaf_payload_size。
@@ -25,6 +26,8 @@ from typing import Any
 
 @dataclass
 class PruneStats:
+    merged_small_subtree_parents: int = 0
+    merged_small_subtree_children: int = 0
     removed_singleton_leaves: int = 0
     removed_empty_nodes: int = 0
     collapsed_single_child_parents: int = 0
@@ -85,6 +88,37 @@ def recalc_node_fields(node: dict[str, Any]) -> None:
     node["leaf_payload_size"] = len(node.get("data_ids", []))
     node["children_count"] = len(node.get("children", []))
     node["subtree_size"] = len(collect_subtree_ids(node))
+
+
+def merge_small_children_subtrees(node: dict[str, Any], stats: PruneStats, child_subtree_threshold: int = 5) -> None:
+    """剪枝前预处理：当节点所有直接子树都很小(<threshold)时，先并入当前节点。
+
+    说明：
+    - 这里的“子树数据量”按每个直接 child 的唯一 data_ids 数量计算。
+    - 采用后序遍历，先处理更深层，再处理当前层，避免遗漏可合并结构。
+    """
+    children = node.get("children", [])
+    for child in children:
+        merge_small_children_subtrees(child, stats, child_subtree_threshold)
+
+    children = node.get("children", [])
+    if not children:
+        return
+
+    child_sizes = [len(collect_subtree_ids(c)) for c in children]
+    if not child_sizes:
+        return
+
+    # 触发条件：当前节点的所有直接子树规模都小于阈值。
+    if all(sz < child_subtree_threshold for sz in child_sizes):
+        merged_ids = list(node.get("data_ids", []))
+        for c in children:
+            merged_ids.extend(collect_subtree_ids(c))
+        node["data_ids"] = list(dict.fromkeys(str(x) for x in merged_ids))
+        stats.merged_small_subtree_parents += 1
+        stats.merged_small_subtree_children += len(children)
+        # 子树已被吸收，当前节点转为叶子（后续常规 prune 再处理）。
+        node["children"] = []
 
 
 def prune_bottom_up(node: dict[str, Any], stats: PruneStats, prune_leaf_size_threshold: int) -> dict[str, Any] | None:
@@ -168,6 +202,8 @@ def main() -> None:
     before_subtree_size = len(collect_subtree_ids(tree))
 
     stats = PruneStats()
+    # 新规则（剪枝前）：先做“小子树全并入父节点”的预处理，降低细碎结构。
+    merge_small_children_subtrees(tree, stats, child_subtree_threshold=5)
     pruned = prune_bottom_up(tree, stats, prune_threshold)
 
     if pruned is None:
@@ -211,6 +247,9 @@ def main() -> None:
             "subtree_size": after_subtree_size,
         },
         "prune_actions": {
+            "merge_small_children_subtree_threshold": 5,
+            "merged_small_subtree_parents": stats.merged_small_subtree_parents,
+            "merged_small_subtree_children": stats.merged_small_subtree_children,
             "prune_leaf_size_threshold": prune_threshold,
             "removed_singleton_leaves": stats.removed_singleton_leaves,
             "removed_empty_nodes": stats.removed_empty_nodes,

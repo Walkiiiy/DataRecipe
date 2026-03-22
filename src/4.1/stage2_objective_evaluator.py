@@ -48,11 +48,26 @@ class ObjectiveEvaluator:
 
     def density(self, cluster: ArrayLike) -> float:
         """Compute Dens(C_k) for one cluster."""
-        c = self._to_2d_array(cluster)
+        # Handle empty clusters explicitly (requested behavior): density = 0.0.
+        c = np.asarray(cluster, dtype=np.float64)
+        if c.size == 0:
+            return 0.0
+        if c.ndim == 1:
+            c = c.reshape(1, -1)
+        if c.ndim != 2:
+            raise ValueError("Each cluster must be a 2D array-like of shape [n_samples, n_features].")
+
+        num_items = int(c.shape[0])
+        if num_items == 0:
+            return 0.0
+        if num_items == 1:
+            # mean_dist = 0, so Dens = 1 * (2 - 0) = 2.0
+            return 2.0
+
         center = c.mean(axis=0, keepdims=True)
         distances = np.linalg.norm(c - center, axis=1)
-        max_dist = float(np.max(distances)) if distances.size > 0 else 0.0
-        return float(np.sum(distances) / (max_dist + self.eps))
+        mean_dist = float(np.mean(distances))
+        return float(num_items * (2.0 - mean_dist))
 
     def separation(self, centers: np.ndarray, index: int) -> float:
         """Compute Sep(C_k) from all cluster centers."""

@@ -69,6 +69,7 @@ class Config:
     max_samples: int | None
     max_layers: int
     root_d_max: float
+    decay_rate: float
     epsilon: float
     log_every: int
     patience_no_1to2_growth: int
@@ -163,12 +164,12 @@ class IncrementalHierarchicalTree:
         return leaf
 
     def _get_subtree_ids(self, node: CapabilityNode) -> list[str]:
-        if node.is_leaf:
-            return list(node.data_ids)
-        merged: list[str] = []
+        # 无论是否为叶子，都先采集当前节点自身携带的数据，
+        # 以兼容“同时拥有 data_ids 与 children”的混合节点形态。
+        merged = list(node.data_ids)
         for child in node.children:
             merged.extend(self._get_subtree_ids(child))
-        # 子树中去重，避免潜在重复 id
+        # 子树中去重，避免重复样本 ID 影响中心计算。
         return list(dict.fromkeys(merged))
 
     def _refresh_center(self, node: CapabilityNode) -> None:
@@ -195,6 +196,188 @@ class IncrementalHierarchicalTree:
         node.d_max = min(node.d_max, upper_bound)
         for child in node.children:
             self._cap_subtree_d_max(child, node.d_max)
+
+    def _rebalance_layer(self, node: CapabilityNode) -> None:
+        """同层 K+1 均值重平衡。
+
+        使用场景：
+        - 在“状态 1: Create New”新增一个分支后，
+          对 node.children 这一层进行局部重分配，降低顺序依赖。
+
+        算法要点：
+        1) 每轮先冻结当前层各簇中心 centers。
+        2) 对每个 child 内部元素逐个做最近中心路由：
+           - data_ids 元素按样本向量路由；
+           - children 元素按子节点 center 路由。
+        3) 若元素更靠近其他兄弟簇，则迁移过去。
+        4) 最多 5 轮；若一轮无迁移则提前停止。
+        """
+        max_iter = 5
+
+        for _ in range(max_iter):
+            # 清理空簇，避免无效中心参与距离计算。
+            node.children = [c for c in node.children if c.data_ids or c.children]
+            if len(node.children) <= 1:
+                break
+
+            # 固定本轮中心（K+1 个簇中心），在本轮迁移过程中不动态更新。
+            centers: list[np.ndarray] = []
+            center_ready = True
+            for c in node.children:
+                if c.center is None:
+                    self._refresh_center(c)
+                if c.center is None:
+                    center_ready = False
+                    break
+                centers.append(c.center.copy())
+
+            if (not center_ready) or len(centers) <= 1:
+                break
+
+            changed = False
+            current_children = list(node.children)  # 快照，保证遍历稳定
+
+            for src_idx, child in enumerate(current_children):
+                # ------- 1) 迁移 data_ids（原子级） -------
+                for sample_id in list(child.data_ids):
+                    vec = self.vector_store.get(sample_id)
+                    if vec is None:
+                        continue
+                    dists = [float(np.linalg.norm(vec - ctr)) for ctr in centers]
+                    best_idx = int(np.argmin(np.asarray(dists)))
+                    if best_idx != src_idx and sample_id in child.data_ids:
+                        child.data_ids.remove(sample_id)
+                        dst = node.children[best_idx]
+                        if sample_id not in dst.data_ids:
+                            dst.data_ids.append(sample_id)
+                        changed = True
+
+                # ------- 2) 迁移 child.children（子树级） -------
+                for sub in list(child.children):
+                    if sub.center is None:
+                        self._refresh_center(sub)
+                    if sub.center is None:
+                        continue
+                    dists = [float(np.linalg.norm(sub.center - ctr)) for ctr in centers]
+                    best_idx = int(np.argmin(np.asarray(dists)))
+                    if best_idx != src_idx and sub in child.children:
+                        child.children.remove(sub)
+                        dst = node.children[best_idx]
+                        if sub not in dst.children:
+                            dst.children.append(sub)
+                        changed = True
+
+            # 清理空簇，并重算存活簇中心，为下一轮做准备。
+            node.children = [c for c in node.children if c.data_ids or c.children]
+            for c in node.children:
+                self._refresh_center(c)
+
+            if not changed:
+                break
+
+    def _rebalance_split(
+        self,
+        target_node: CapabilityNode,
+        new_vec: np.ndarray,
+        new_id: str,
+        split_d_max: float,
+    ) -> CapabilityNode:
+        """局部 2-Means 重平衡分裂。
+
+        思路：
+        1) 以 target_node.center 和 new_vec 初始化两个中心 C1/C2。
+        2) 在局部候选项上迭代 2-Means（最多 10 轮）做重分配。
+        3) 用最终两组构造 child1/child2，并统一收紧到 split_d_max。
+        4) 返回新的父节点 P_new（children=[child1, child2]）。
+        """
+
+        def run_local_2means(item_vecs: list[np.ndarray], c1_init: np.ndarray, c2_init: np.ndarray) -> tuple[list[int], list[int]]:
+            c1 = c1_init.copy()
+            c2 = c2_init.copy()
+            prev_assign: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+
+            for _ in range(10):
+                group1: list[int] = []
+                group2: list[int] = []
+                for i, vec in enumerate(item_vecs):
+                    d1 = float(np.linalg.norm(vec - c1))
+                    d2 = float(np.linalg.norm(vec - c2))
+                    if d1 <= d2:
+                        group1.append(i)
+                    else:
+                        group2.append(i)
+
+                # 避免空簇：若某组为空，从另一组挪一个“离本组中心最远”的样本。
+                if not group1 and group2:
+                    move_i = max(group2, key=lambda idx: float(np.linalg.norm(item_vecs[idx] - c2)))
+                    group2.remove(move_i)
+                    group1.append(move_i)
+                elif not group2 and group1:
+                    move_i = max(group1, key=lambda idx: float(np.linalg.norm(item_vecs[idx] - c1)))
+                    group1.remove(move_i)
+                    group2.append(move_i)
+
+                assign = (tuple(sorted(group1)), tuple(sorted(group2)))
+                c1 = np.stack([item_vecs[i] for i in group1], axis=0).mean(axis=0)
+                c2 = np.stack([item_vecs[i] for i in group2], axis=0).mean(axis=0)
+                if assign == prev_assign:
+                    return list(assign[0]), list(assign[1])
+                prev_assign = assign
+
+            # 达到最大迭代次数，返回最后一次分配
+            assert prev_assign is not None
+            return list(prev_assign[0]), list(prev_assign[1])
+
+        c1_init = target_node.center.copy() if target_node.center is not None else new_vec.copy()
+        c2_init = new_vec.copy()
+
+        if target_node.is_leaf:
+            # 叶子分裂：在 data_ids + new_id 上做局部重平衡。
+            item_ids = list(dict.fromkeys(list(target_node.data_ids) + [new_id]))
+            if len(item_ids) <= 1:
+                # 兜底：极端情况下没有可分样本，退化成“原叶子 + 新叶子”。
+                child1 = self._new_leaf_from_ids(item_ids, d_max=split_d_max)
+                child2 = self._new_leaf_node(new_id, d_max=split_d_max)
+            else:
+                item_vecs = [new_vec if sid == new_id else self.vector_store[sid] for sid in item_ids]
+                g1, g2 = run_local_2means(item_vecs, c1_init, c2_init)
+                child1_ids = [item_ids[i] for i in g1]
+                child2_ids = [item_ids[i] for i in g2]
+                child1 = self._new_leaf_from_ids(child1_ids, d_max=split_d_max)
+                child2 = self._new_leaf_from_ids(child2_ids, d_max=split_d_max)
+        else:
+            # 内部节点分裂：在 children + new_leaf 上做局部重平衡。
+            new_leaf = self._new_leaf_node(new_id, d_max=split_d_max)
+            items: list[CapabilityNode] = list(target_node.children) + [new_leaf]
+            item_vecs: list[np.ndarray] = []
+            for item in items:
+                if item.center is None:
+                    self._refresh_center(item)
+                item_vecs.append(item.center.copy())
+
+            g1, g2 = run_local_2means(item_vecs, c1_init, c2_init)
+            group1_nodes = [items[i] for i in g1]
+            group2_nodes = [items[i] for i in g2]
+
+            def build_child(nodes: list[CapabilityNode]) -> CapabilityNode:
+                if len(nodes) == 1:
+                    return nodes[0]
+                internal = self._new_internal_node(split_d_max)
+                internal.children = list(nodes)
+                self._refresh_center(internal)
+                return internal
+
+            child1 = build_child(group1_nodes)
+            child2 = build_child(group2_nodes)
+
+        # 分裂后统一收紧两侧子树阈值，保证层级阈值单调递减。
+        self._cap_subtree_d_max(child1, split_d_max)
+        self._cap_subtree_d_max(child2, split_d_max)
+
+        p_new = self._new_internal_node(split_d_max)
+        p_new.children = [child1, child2]
+        self._refresh_center(p_new)
+        return p_new
 
     # -----------------------------
     # J 计算辅助函数
@@ -277,6 +460,9 @@ class IncrementalHierarchicalTree:
         # 状态 1: Create New（距离过远）
         if d_min >= node.d_max:
             node.children.append(self._new_leaf_node(data_id, d_max=node.d_max))
+            # 核心修复：新增分支后执行同层重平衡，
+            # 让旧兄弟簇中“更靠近新分支”的元素迁移过来，降低顺序依赖。
+            self._rebalance_layer(node)
             self._refresh_center_upward(path)
             return
 
@@ -303,13 +489,10 @@ class IncrementalHierarchicalTree:
             self._refresh_center_upward(path)
             return
 
-        # 状态 3: Split（J 下降）-> 创建中间父节点 P_new，替换最近 child。
-        split_d_max = min(node.d_max, max(d_min, self.cfg.epsilon))
-        p_new = self._new_internal_node(split_d_max)
-        new_leaf = self._new_leaf_node(data_id, d_max=split_d_max)
-        self._cap_subtree_d_max(nearest, split_d_max)
-        p_new.children = [nearest, new_leaf]
-        self._refresh_center(p_new)
+        # 状态 3: Split（J 下降且未触底）-> 触发局部重平衡分裂
+        # 用统一比例衰减收紧阈值，再在 nearest 子树 + 新样本上执行局部 2-Means 重分配。
+        split_d_max = node.d_max * self.cfg.decay_rate
+        p_new = self._rebalance_split(nearest, vector, data_id, split_d_max)
         node.children[nearest_idx] = p_new
         self._refresh_center_upward(path)
 
@@ -435,6 +618,12 @@ def parse_args() -> argparse.Namespace:
         default=0.35,
         help="根节点初始相关性阈值 D_max；后续节点在 split 过程中动态收缩。",
     )
+    parser.add_argument(
+        "--decay-rate",
+        type=float,
+        default=0.95,
+        help="Split 时 d_max 的统一比例衰减系数，split_d_max = node.d_max * decay_rate。",
+    )
     parser.add_argument("--epsilon", type=float, default=1e-5)
     parser.add_argument("--log-every", type=int, default=100, help="每处理多少条打印一次阶段快照")
     parser.add_argument(
@@ -502,6 +691,7 @@ def main() -> None:
         max_samples=max_samples,
         max_layers=max(1, args.max_layers),
         root_d_max=max(1e-8, args.root_d_max),
+        decay_rate=max(1e-8, args.decay_rate),
         epsilon=max(1e-12, args.epsilon),
         log_every=max(1, args.log_every),
         patience_no_1to2_growth=max(0, args.patience_no_1to2_growth),
@@ -559,6 +749,7 @@ def main() -> None:
         "global_J": tree.global_j(),
         "max_layers": cfg.max_layers,
         "root_d_max": cfg.root_d_max,
+        "decay_rate": cfg.decay_rate,
         "patience_no_1to2_growth": cfg.patience_no_1to2_growth,
         "final_no_1to2_streak": no_1to2_streak,
         "converged_early": bool(
