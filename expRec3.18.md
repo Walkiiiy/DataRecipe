@@ -828,3 +828,359 @@ python src/4.1HDBSCN/EXP/data_sampling_by_hdbscan.py \
   --budget-n 1000 \
   --random-seed 42 \
   --log-level INFO -->
+
+
+
+
+
+  -----------------------------------------------
+  # 重跑
+  # magicoder
+
+
+export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
+  python src/4.1/stage1_atomic_profile.py \
+  --input data/magicoder/train.jsonl \
+  --output data/magicoder/magicoder_cdt_profile.jsonl \
+  --max-samples 10000000 \
+  --concurrency 32 \
+  --model deepseek-chat \
+
+
+
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/magicoder/magicoder_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 1 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/magicoder/capability_tree_final.json \
+  --output-tree-json data/magicoder/capability_tree_final_pruned.json \
+  --output-summary-json data/magicoder/capability_tree_summary_pruned.json 
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/magicoder/capability_tree_final_pruned.json   --profile-jsonl data/magicoder/magicoder_cdt_profile.jsonl   --out-dir data/magicoder/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/magicoder/train.jsonl \
+  --out-dir data/magicoder/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/magicoder/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/magicoder/magicoder_cdt_profile.jsonl \
+  --out-dir data/magicoder/exp \
+  --budget-n 1000 \
+  --kmeans-k 12
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/magicoder/exp/dataset_ours.jsonl::data/magicoder/exp/run_ours_shared_eval \
+  --run kmeans::data/magicoder/exp/dataset_kmeans.jsonl::data/magicoder/exp/run_kmeans_shared_eval \
+  --run random::data/magicoder/exp/dataset_random.jsonl::data/magicoder/exp/run_random_shared_eval \
+  --run category::data/magicoder/exp/dataset_category.jsonl::data/magicoder/exp/run_category_shared_eval \
+  --eval-source-jsonl data/magicoder/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/magicoder/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
+
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/magicoder/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/magicoder/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/magicoder/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/magicoder/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/magicoder/exp/figures
+
+
+
+
+# alpaca
+
+
+
+
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/alpaca/alpaca_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 0.75 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/alpaca/capability_tree_final.json \
+  --output-tree-json data/alpaca/capability_tree_final_pruned.json \
+  --output-summary-json data/alpaca/capability_tree_summary_pruned.json 
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/alpaca/capability_tree_final_pruned.json   --profile-jsonl data/alpaca/alpaca_cdt_profile.jsonl   --out-dir data/alpaca/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/alpaca/train.jsonl \
+  --out-dir data/alpaca/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/alpaca/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/alpaca/alpaca_cdt_profile.jsonl \
+  --out-dir data/alpaca/exp \
+  --budget-n 1000 \
+  --kmeans-k 8
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/alpaca/exp/dataset_ours.jsonl::data/alpaca/exp/run_ours_shared_eval \
+  --run kmeans::data/alpaca/exp/dataset_kmeans.jsonl::data/alpaca/exp/run_kmeans_shared_eval \
+  --run random::data/alpaca/exp/dataset_random.jsonl::data/alpaca/exp/run_random_shared_eval \
+  --run category::data/alpaca/exp/dataset_category.jsonl::data/alpaca/exp/run_category_shared_eval \
+  --eval-source-jsonl data/alpaca/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/alpaca/exp/shared_eval \
+  --base_model EleutherAI/gpt-neo-125m
+
+
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/alpaca/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/alpaca/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/alpaca/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/alpaca/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/alpaca/exp/figures
+
+
+
+# dialogsum
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/dialogsum/dialogsum_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 0.85 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/dialogsum/capability_tree_final.json \
+  --output-tree-json data/dialogsum/capability_tree_final_pruned.json \
+  --output-summary-json data/dialogsum/capability_tree_summary_pruned.json 
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/dialogsum/capability_tree_final_pruned.json   --profile-jsonl data/dialogsum/dialogsum_cdt_profile.jsonl   --out-dir data/dialogsum/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/dialogsum/train.jsonl \
+  --out-dir data/dialogsum/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/dialogsum/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/dialogsum/dialogsum_cdt_profile.jsonl \
+  --out-dir data/dialogsum/exp \
+  --budget-n 1000 \
+  --kmeans-k 3
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/dialogsum/exp/dataset_ours.jsonl::data/dialogsum/exp/run_ours_shared_eval \
+  --run kmeans::data/dialogsum/exp/dataset_kmeans.jsonl::data/dialogsum/exp/run_kmeans_shared_eval \
+  --run random::data/dialogsum/exp/dataset_random.jsonl::data/dialogsum/exp/run_random_shared_eval \
+  --run category::data/dialogsum/exp/dataset_category.jsonl::data/dialogsum/exp/run_category_shared_eval \
+  --eval-source-jsonl data/dialogsum/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/dialogsum/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
+
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/dialogsum/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/dialogsum/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/dialogsum/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/dialogsum/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/dialogsum/exp/figures
+
+
+
+
+#  data_ablation
+
+export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
+  python src/4.1/stage1_atomic_profile.py \
+  --input data/data_ablation/train_full.jsonl \
+  --output data/data_ablation/data_ablation_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --concurrency 32 \
+  --model deepseek-chat \
+  --base-url https://api.deepseek.com
+
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/data_ablation/data_ablation_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 0.9 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+  --decay-rate 0.9
+
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/data_ablation/capability_tree_final.json \
+  --output-tree-json data/data_ablation/capability_tree_final_pruned.json \
+  --output-summary-json data/data_ablation/capability_tree_summary_pruned.json 
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/data_ablation/capability_tree_final_pruned.json   --profile-jsonl data/data_ablation/data_ablation_cdt_profile.jsonl   --out-dir data/data_ablation/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/data_ablation/train_full.jsonl \
+  --out-dir data/data_ablation/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/data_ablation/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/data_ablation/data_ablation_cdt_profile.jsonl \
+  --out-dir data/data_ablation/exp \
+  --budget-n 1000 \
+  --kmeans-k 10
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/data_ablation/exp/dataset_ours.jsonl::data/data_ablation/exp/run_ours_shared_eval \
+  --eval-source-jsonl data/data_ablation/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/data_ablation/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
+
+
+  --run kmeans::data/data_ablation/exp/dataset_kmeans.jsonl::data/data_ablation/exp/run_kmeans_shared_eval \
+  --run random::data/data_ablation/exp/dataset_random.jsonl::data/data_ablation/exp/run_random_shared_eval \
+  --run category::data/data_ablation/exp/dataset_category.jsonl::data/data_ablation/exp/run_category_shared_eval \
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/data_ablation/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/data_ablation/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/data_ablation/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/data_ablation/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/data_ablation/exp/figures
+
+
+
+
+
+
+# alpaca效果不好 再试一次 mllu
+
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/mmlu/mmlu_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 0.9 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+
+
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/mmlu/capability_tree_final.json \
+  --output-tree-json data/mmlu/capability_tree_final_pruned.json \
+  --output-summary-json data/mmlu/capability_tree_summary_pruned.json 
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/mmlu/capability_tree_final_pruned.json   --profile-jsonl data/mmlu/mmlu_cdt_profile.jsonl   --out-dir data/mmlu/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/mmlu/train.jsonl \
+  --out-dir data/mmlu/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/mmlu/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/mmlu/mmlu_cdt_profile.jsonl \
+  --out-dir data/mmlu/exp \
+  --budget-n 1000 \
+  --kmeans-k 8
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/mmlu/exp/dataset_ours.jsonl::data/mmlu/exp/run_ours_shared_eval \
+  --run kmeans::data/mmlu/exp/dataset_kmeans.jsonl::data/mmlu/exp/run_kmeans_shared_eval \
+  --run random::data/mmlu/exp/dataset_random.jsonl::data/mmlu/exp/run_random_shared_eval \
+  --run category::data/mmlu/exp/dataset_category.jsonl::data/mmlu/exp/run_category_shared_eval \
+  --eval-source-jsonl data/mmlu/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/mmlu/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
+
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/mmlu/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/mmlu/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/mmlu/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/mmlu/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/mmlu/exp/figures
+
+效果不错
+# data_ablation效果不佳，再试一次gsm

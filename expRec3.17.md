@@ -208,19 +208,19 @@ python src/4.1/EXP/visualize_results.py \
   --out-dir data/dolly-15k/exp/figures
 
 python src/4.1/EXP/visualize_results.py \
-  --ours-log-csv data/alpaca-gpt4-data-en/exp/run_ours/train_eval_log.csv \
-  --kmeans-log-csv data/alpaca-gpt4-data-en/exp/run_kmeans/train_eval_log.csv \
-  --random-log-csv data/alpaca-gpt4-data-en/exp/run_random/train_eval_log.csv \
-  --category-log-csv data/alpaca-gpt4-data-en/exp/run_category/train_eval_log.csv \
-  --out-dir data/alpaca-gpt4-data-en/exp/figures
+  --ours-log-csv data/alpaca/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/alpaca/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/alpaca/exp/run_random_shared_eval/train_eval_log.csv \
+  --out-dir data/alpaca/exp/figures_shared_eval
 
+  --category-log-csv data/alpaca/exp/run_category/train_eval_log.csv \
 
 python src/4.1/EXP/visualize_results.py \
-  --ours-log-csv data/data_ablation_full59K/exp/run_ours/train_eval_log.csv \
-  --kmeans-log-csv data/data_ablation_full59K/exp/run_kmeans/train_eval_log.csv \
-  --random-log-csv data/data_ablation_full59K/exp/run_random/train_eval_log.csv \
-  --category-log-csv data/data_ablation_full59K/exp/run_category/train_eval_log.csv \
-  --out-dir data/data_ablation_full59K/exp/figures
+  --ours-log-csv data/data_ablation_full59K/exp/run_ours_shred_eval/train_eval_log.csv \
+  --kmeans-log-csv data/data_ablation_full59K/exp/run_kmeans_shred_eval/train_eval_log.csv \
+  --random-log-csv data/data_ablation_full59K/exp/run_random_shred_eval/train_eval_log.csv \
+  --category-log-csv data/data_ablation_full59K/exp/run_category_shred_eval/train_eval_log.csv \
+  --out-dir data/data_ablation_full59K/exp/figures_shared_eval
 
 
 - 加测试集和测试脚本
