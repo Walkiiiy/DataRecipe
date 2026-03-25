@@ -345,17 +345,21 @@ class ResponseOnlyCollator:
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         core_features = []
         for f in features:
-            core_features.append(
-                {
-                    "input_ids": f["input_ids"],
-                    "attention_mask": f["attention_mask"],
-                }
-            )
+            item: dict[str, Any] = {"input_ids": f["input_ids"]}
+            # Some TRL/Transformers versions pass only input_ids into data_collator.
+            if "attention_mask" in f and f["attention_mask"] is not None:
+                item["attention_mask"] = f["attention_mask"]
+            core_features.append(item)
         batch = self.tokenizer.pad(
             core_features,
             padding=True,
             return_tensors="pt",
         )
+        if "attention_mask" not in batch:
+            pad_id = self.tokenizer.pad_token_id
+            if pad_id is None:
+                raise ValueError("Tokenizer has no pad_token_id and attention_mask is missing.")
+            batch["attention_mask"] = (batch["input_ids"] != pad_id).long()
         labels = batch["input_ids"].clone()
         labels[batch["attention_mask"] == 0] = -100
 

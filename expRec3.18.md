@@ -1322,4 +1322,75 @@ python src/4.1/EXP/visualize_results.py \
   --out-dir data/lawyer/exp/figures
 
 
-# 新数据集 
+# 新数据集 banking77
+banking77
+
+export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
+  python src/4.1/stage1_atomic_profile.py \
+  --input data/banking77/train.jsonl \
+  --output data/banking77/banking77_cdt_profile.jsonl \
+  --max-samples 10000000 \
+  --concurrency 32 \
+  --model deepseek-chat
+
+
+
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/banking77/banking77_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 0.55 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/banking77/capability_tree_final.json \
+  --output-tree-json data/banking77/capability_tree_final_pruned.json \
+  --output-summary-json data/banking77/capability_tree_summary_pruned.json 
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/banking77/capability_tree_final_pruned.json   --profile-jsonl data/banking77/banking77_cdt_profile.jsonl   --out-dir data/banking77/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/banking77/train.jsonl \
+  --out-dir data/banking77/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/banking77/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/banking77/banking77_cdt_profile.jsonl \
+  --out-dir data/banking77/exp \
+  --budget-n 1000 \
+  --kmeans-k 18
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/banking77/exp/dataset_ours.jsonl::data/banking77/exp/run_ours_shared_eval \
+  --run kmeans::data/banking77/exp/dataset_kmeans.jsonl::data/banking77/exp/run_kmeans_shared_eval \
+  --run random::data/banking77/exp/dataset_random.jsonl::data/banking77/exp/run_random_shared_eval \
+  --run category::data/banking77/exp/dataset_category.jsonl::data/banking77/exp/run_category_shared_eval \
+  --eval-source-jsonl data/banking77/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/banking77/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
+  --eval-steps-mode manual \
+  --eval_steps 5
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/banking77/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/banking77/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/banking77/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/banking77/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/banking77/exp/figures
