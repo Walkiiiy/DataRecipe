@@ -212,7 +212,7 @@ class IncrementalHierarchicalTree:
         3) 若元素更靠近其他兄弟簇，则迁移过去。
         4) 最多 5 轮；若一轮无迁移则提前停止。
         """
-        max_iter = 5
+        max_iter = 10
 
         for _ in range(max_iter):
             # 清理空簇，避免无效中心参与距离计算。

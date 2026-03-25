@@ -41,6 +41,8 @@ try:
 except Exception:  # noqa: BLE001
     snapshot_download = None
 
+RESPONSE_MARKER = "### Response:\n"
+
 
 @dataclass
 class MethodJob:
@@ -316,6 +318,66 @@ class EvalLossCallback(TrainerCallback):
             logging.info("Eval step=%s eval_loss=%.6f", state.global_step, float(metrics["eval_loss"]))
 
 
+def _find_subsequence(seq: list[int], pattern: list[int]) -> int:
+    if not pattern or len(pattern) > len(seq):
+        return -1
+    end = len(seq) - len(pattern) + 1
+    for i in range(end):
+        if seq[i : i + len(pattern)] == pattern:
+            return i
+    return -1
+
+
+class ResponseOnlyCollator:
+    """只对 Response 段计算 labels（prompt 段全部 -100）。"""
+
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+        variants = [RESPONSE_MARKER, f"\n{RESPONSE_MARKER}", f"\n\n{RESPONSE_MARKER}"]
+        self.marker_token_variants: list[list[int]] = []
+        for text in variants:
+            marker_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+            if marker_ids and marker_ids not in self.marker_token_variants:
+                self.marker_token_variants.append(marker_ids)
+        if not self.marker_token_variants:
+            raise ValueError("Failed to build response marker token ids.")
+
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+        core_features = []
+        for f in features:
+            core_features.append(
+                {
+                    "input_ids": f["input_ids"],
+                    "attention_mask": f["attention_mask"],
+                }
+            )
+        batch = self.tokenizer.pad(
+            core_features,
+            padding=True,
+            return_tensors="pt",
+        )
+        labels = batch["input_ids"].clone()
+        labels[batch["attention_mask"] == 0] = -100
+
+        for i in range(labels.size(0)):
+            seq_len = int(batch["attention_mask"][i].sum().item())
+            seq = batch["input_ids"][i, :seq_len].tolist()
+            response_start = -1
+            for marker in self.marker_token_variants:
+                pos = _find_subsequence(seq, marker)
+                if pos != -1:
+                    response_start = pos + len(marker)
+                    break
+            if response_start == -1:
+                # 异常样本：找不到 marker 时不参与 loss。
+                labels[i, :seq_len] = -100
+                continue
+            labels[i, :response_start] = -100
+
+        batch["labels"] = labels
+        return batch
+
+
 def export_logs(log_history: list[dict[str, Any]], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     raw_json = out_dir / "log_history.json"
@@ -383,6 +445,7 @@ def build_sft_trainer(
 ):
     sig = inspect.signature(SFTTrainer.__init__)
     params = sig.parameters
+    response_only_collator = ResponseOnlyCollator(tokenizer)
 
     kwargs: dict[str, Any] = {
         "model": model,
@@ -406,6 +469,10 @@ def build_sft_trainer(
         kwargs["max_seq_length"] = max_seq_length
     if "packing" in params:
         kwargs["packing"] = False
+    if "data_collator" in params:
+        kwargs["data_collator"] = response_only_collator
+    else:
+        raise RuntimeError("SFTTrainer has no `data_collator` parameter, cannot enforce response-only loss.")
     return SFTTrainer(**kwargs)
 
 

@@ -1056,13 +1056,21 @@ export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
 python src/4.1/stage3_overlapping_incremental_hierarchy.py \
   --input-jsonl data/data_ablation/data_ablation_cdt_profile.jsonl \
   --max-samples 2000 \
-  --d-max 0.9 \
+  --d-max 0.8 \
   --log-every 100 \
   --patience-no-1to2-growth 2000 \
   --max-layers 15 \
-  --log-level INFO
-  --decay-rate 0.9
+  --log-level INFO \
+  --decay-rate 0.85
 
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/data_ablation/data_ablation_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 1 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO \
 
 python src/4.1/stage4_prune_singleton_tree.py \
   --input-tree-json data/data_ablation/capability_tree_final.json \
@@ -1070,7 +1078,7 @@ python src/4.1/stage4_prune_singleton_tree.py \
   --output-summary-json data/data_ablation/capability_tree_summary_pruned.json 
 
 
-python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/data_ablation/capability_tree_final_pruned.json   --profile-jsonl data/data_ablation/data_ablation_cdt_profile.jsonl   --out-dir data/data_ablation/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/data_ablation/capability_tree_final_pruned.json   --profile-jsonl data/data_ablation/data_ablation_cdt_profile.jsonl   --out-dir data/data_ablation/exp   --min-valid-cluster-size 2   --random-seed 42 --budget-n 1000
 
 
 python src/4.1/EXP/data_sampling_by_category.py \
@@ -1097,14 +1105,18 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
   --eval-source-jsonl data/data_ablation/train.jsonl \
   --eval-ratio 0.05 \
   --seed 42 \
-  --num_train_epochs 4 \
+  --num_train_epochs 5 \
   --output-root data/data_ablation/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct
-
+  --base_model Qwen/Qwen2.5-0.5B-Instruct \
+  --eval-steps-mode manual \
+  --eval_steps 5
 
   --run kmeans::data/data_ablation/exp/dataset_kmeans.jsonl::data/data_ablation/exp/run_kmeans_shared_eval \
   --run random::data/data_ablation/exp/dataset_random.jsonl::data/data_ablation/exp/run_random_shared_eval \
   --run category::data/data_ablation/exp/dataset_category.jsonl::data/data_ablation/exp/run_category_shared_eval \
+
+
+
 
 
 python src/4.1/EXP/visualize_results.py \
@@ -1183,4 +1195,131 @@ python src/4.1/EXP/visualize_results.py \
   --out-dir data/mmlu/exp/figures
 
 效果不错
-# data_ablation效果不佳，再试一次gsm
+# data_ablation效果不佳，再试一次 gsm
+
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/gsm/gsm_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 1 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/gsm/capability_tree_final.json \
+  --output-tree-json data/gsm/capability_tree_final_pruned.json \
+  --output-summary-json data/gsm/capability_tree_summary_pruned.json 
+
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/gsm/capability_tree_final_pruned.json   --profile-jsonl data/gsm/gsm_cdt_profile.jsonl   --out-dir data/gsm/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/gsm/train.jsonl \
+  --out-dir data/gsm/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/gsm/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/gsm/gsm_cdt_profile.jsonl \
+  --out-dir data/gsm/exp \
+  --budget-n 1000 \
+  --kmeans-k 4
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/gsm/exp/dataset_ours.jsonl::data/gsm/exp/run_ours_shared_eval \
+  --eval-source-jsonl data/gsm/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/gsm/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
+
+
+  --run ours::data/gsm/exp/dataset_ours.jsonl::data/gsm/exp/run_ours_shared_eval \
+  --run kmeans::data/gsm/exp/dataset_kmeans.jsonl::data/gsm/exp/run_kmeans_shared_eval \
+  --run random::data/gsm/exp/dataset_random.jsonl::data/gsm/exp/run_random_shared_eval \
+  --run category::data/gsm/exp/dataset_category.jsonl::data/gsm/exp/run_category_shared_eval \
+
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/gsm/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/gsm/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/gsm/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/gsm/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/gsm/exp/figures
+
+  也不好
+# lawyer
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/lawyer/lawyer_cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 1 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/lawyer/capability_tree_final.json \
+  --output-tree-json data/lawyer/capability_tree_final_pruned.json \
+  --output-summary-json data/lawyer/capability_tree_summary_pruned.json 
+
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/lawyer/capability_tree_final_pruned.json   --profile-jsonl data/lawyer/lawyer_cdt_profile.jsonl   --out-dir data/lawyer/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/lawyer/train.jsonl \
+  --out-dir data/lawyer/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/gsm/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/gsm/gsm_cdt_profile.jsonl \
+  --out-dir data/gsm/exp \
+  --budget-n 1000 \
+  --kmeans-k 4
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/lawyer/exp/dataset_ours.jsonl::data/lawyer/exp/run_ours_shared_eval \
+  --eval-source-jsonl data/lawyer/train.jsonl \
+  --eval-ratio 0.05 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/lawyer/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
+
+
+
+  --run kmeans::data/lawyer/exp/dataset_kmeans.jsonl::data/lawyer/exp/run_kmeans_shared_eval \
+  --run random::data/lawyer/exp/dataset_random.jsonl::data/lawyer/exp/run_random_shared_eval \
+  --run category::data/lawyer/exp/dataset_category.jsonl::data/lawyer/exp/run_category_shared_eval \
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/lawyer/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/lawyer/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/lawyer/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/lawyer/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/lawyer/exp/figures
+
+
+# 新数据集 
