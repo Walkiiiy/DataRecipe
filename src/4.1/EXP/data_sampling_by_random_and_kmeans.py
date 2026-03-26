@@ -89,7 +89,7 @@ def build_embeddings(rows: list[dict[str, Any]], model_name: str, device: str) -
     if SentenceTransformer is None:
         raise ImportError("Missing sentence-transformers/torch. Install before running kmeans baseline.")
     model = SentenceTransformer(model_name, device=resolve_device(device))
-    texts = [str(r.get("CDT_description") or r.get("T_description") or "").strip() for r in rows]
+    texts = [str(r.get("instruction") or "").strip() for r in rows]
     vectors = model.encode(
         texts,
         batch_size=256,

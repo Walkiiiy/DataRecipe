@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,23 +22,29 @@ logger = logging.getLogger(__name__)
 class DeepSeekDeltaScorer:
     """DEITA delta scorer with DeepSeek API backend.
 
-    This keeps DEITA's prompt templates and score computation logic unchanged.
-    The only replacement is the model backend: local HF model -> DeepSeek API.
+    Adapted for OpenAI-compatible APIs by requesting strict numeric outputs (1-6)
+    and parsing them directly. Falls back to logprob-based expectation when needed.
     """
 
     complexity_template = (
-        "You are a helpful assistant. Please identify the complexity score of the following user query. \n"
-        "##Query: {instruction}  \n"
-        "##Complexity: "
+        "You are a strict grader.\n"
+        "Evaluate the complexity of the following user query on a 1-6 scale.\n"
+        "Return ONLY one digit: 1, 2, 3, 4, 5, or 6.\n"
+        "No words, no explanation, no markdown, no punctuation.\n"
+        "##Query: {instruction}\n"
+        "##Complexity:"
     )
 
     quality_template = (
-        "You are a helpful assistant. Please identify the quality score of the Response corresponding to the Question. \n"
-        " #Question#:\n"
+        "You are a strict grader.\n"
+        "Evaluate the response quality for the given question on a 1-6 scale.\n"
+        "Return ONLY one digit: 1, 2, 3, 4, 5, or 6.\n"
+        "No words, no explanation, no markdown, no punctuation.\n"
+        "#Question#:\n"
         "{instruction}\n"
         "#Response#:\n"
-        "{output} \n"
-        "##Quality: "
+        "{output}\n"
+        "##Quality:"
     )
 
     score_template = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
@@ -212,6 +219,27 @@ class DeepSeekDeltaScorer:
         score = float(sum(p * s for p, s in zip(probs, DeepSeekDeltaScorer.score_template)))
         return score
 
+    @staticmethod
+    def _extract_digit_score(text: str) -> Optional[float]:
+        """Extract a single-digit score from model text output."""
+        if not text:
+            return None
+
+        cleaned = text.strip()
+        if not cleaned:
+            return None
+
+        # Fast path: exact one-digit output.
+        if cleaned in {"1", "2", "3", "4", "5", "6"}:
+            return float(cleaned)
+
+        # Allow wrappers like "**4**" or "Score: 4".
+        match = re.search(r"(?<!\d)([1-6])(?!\d)", cleaned)
+        if match:
+            return float(match.group(1))
+
+        return None
+
     def _call_deepseek(self, user_input: str) -> float:
         payload = {
             "model": self.model,
@@ -252,6 +280,11 @@ class DeepSeekDeltaScorer:
                 if not choices:
                     logger.warning("Empty choices from DeepSeek, fallback score=3.0")
                     return 3.0
+
+                message_content = choices[0].get("message", {}).get("content", "")
+                parsed_score = self._extract_digit_score(str(message_content))
+                if parsed_score is not None:
+                    return parsed_score
 
                 top_logprobs = self._extract_top_logprobs(choices[0].get("logprobs"))
                 if not top_logprobs:
