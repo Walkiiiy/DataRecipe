@@ -23,12 +23,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import requests
 
 try:
     from tqdm import tqdm
 except Exception:  # noqa: BLE001
     tqdm = None
+
+try:
+    import torch
+    from sentence_transformers import SentenceTransformer
+except Exception:  # noqa: BLE001
+    torch = None
+    SentenceTransformer = None
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_TREE_JSON = Path("data/alpaca-gpt4-data-en/capability_tree_final_pruned.json")
@@ -274,6 +282,12 @@ class Config:
     retry_base_delay: float
     temperature: float
     max_tokens: int
+    include_center_vector: bool
+    center_vector_precision: int
+    embedding_model: str
+    embedding_device: str
+    embedding_batch_size: int
+    force_rebuild_center_vector: bool
     resume: bool
 
 
@@ -315,6 +329,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry-base-delay", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=160)
+    parser.add_argument(
+        "--include-center-vector",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to compute and save each cluster centroid vector in output jsonl.",
+    )
+    parser.add_argument(
+        "--center-vector-precision",
+        type=int,
+        default=6,
+        help="Round centroid vector to N decimals; -1 means no rounding.",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default="BAAI/bge-base-en-v1.5",
+        help="Embedding model used to compute cluster centroid vectors.",
+    )
+    parser.add_argument(
+        "--embedding-device",
+        type=str,
+        default="auto",
+        help="Embedding device: auto/cpu/cuda",
+    )
+    parser.add_argument(
+        "--embedding-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for embedding encoding when building centroid vectors.",
+    )
+    parser.add_argument(
+        "--force-rebuild-center-vector",
+        action="store_true",
+        help="Force rebuild center_vector for all clusters (useful when switching embedding model).",
+    )
     parser.add_argument("--resume", action="store_true", help="Skip node_id already existing in output jsonl.")
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
@@ -465,6 +514,88 @@ def build_cluster_signature(
         "top_keywords": [{"keyword": x, "count": int(y)} for x, y in top_keywords],
         "query_examples": [clip_text(x, 120) for x in query_samples[:4]],
     }
+
+
+def resolve_embedding_device(device: str) -> str:
+    if device != "auto":
+        return device
+    if torch is not None and torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+class DenseVectorizer:
+    def __init__(self, model_name: str, device: str):
+        if SentenceTransformer is None or torch is None:
+            raise RuntimeError(
+                "sentence-transformers/torch is required for center_vector computation, "
+                "but is not installed in current environment."
+            )
+        self.model = SentenceTransformer(model_name, device=resolve_embedding_device(device))
+
+    def encode_texts(self, texts: list[str], batch_size: int) -> np.ndarray:
+        vectors = self.model.encode(
+            texts,
+            batch_size=max(1, batch_size),
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        return np.asarray(vectors, dtype=np.float32)
+
+
+def row_to_embedding_text(row: dict[str, Any]) -> str:
+    instruction = clean_text(row.get("instruction"))
+    inp = clean_text(row.get("input"))
+    out = clean_text(row.get("output") or row.get("response"))
+    chunks = [x for x in [instruction, inp, out] if x]
+    return "\n".join(chunks).strip()
+
+
+def build_profile_vector_store(
+    profile_map: dict[str, dict[str, Any]],
+    clusters: list[ClusterSpec],
+    cfg: Config,
+) -> dict[str, np.ndarray]:
+    needed_ids: list[str] = []
+    seen: set[str] = set()
+    for spec in clusters:
+        for rid in spec.data_ids:
+            if rid in profile_map and rid not in seen:
+                seen.add(rid)
+                needed_ids.append(rid)
+
+    if not needed_ids:
+        return {}
+
+    logging.info(
+        "Building embedding vectors for centroid computation: ids=%d, model=%s, device=%s",
+        len(needed_ids),
+        cfg.embedding_model,
+        resolve_embedding_device(cfg.embedding_device),
+    )
+    texts = [row_to_embedding_text(profile_map[rid]) for rid in needed_ids]
+    vectorizer = DenseVectorizer(cfg.embedding_model, cfg.embedding_device)
+    vectors = vectorizer.encode_texts(texts, batch_size=cfg.embedding_batch_size)
+
+    store: dict[str, np.ndarray] = {}
+    for rid, vec in zip(needed_ids, vectors):
+        store[rid] = vec
+    return store
+
+
+def compute_cluster_center_vector(
+    spec: ClusterSpec,
+    vector_store: dict[str, np.ndarray],
+    precision: int,
+) -> list[float]:
+    vecs = [vector_store[rid] for rid in spec.data_ids if rid in vector_store]
+    if not vecs:
+        return []
+    center = np.stack(vecs, axis=0).mean(axis=0)
+    if precision >= 0:
+        center = np.round(center, decimals=precision)
+    return [float(x) for x in center.tolist()]
 
 
 def collect_subtree_ids(node: dict[str, Any]) -> list[str]:
@@ -876,6 +1007,7 @@ def process_cluster(
     spec: ClusterSpec,
     cfg: Config,
     profile_map: dict[str, dict[str, Any]],
+    vector_store: dict[str, np.ndarray],
     namer: DeepSeekClusterNamer,
 ) -> dict[str, Any]:
     signature = build_cluster_signature(spec=spec, profile_map=profile_map)
@@ -906,6 +1038,13 @@ def process_cluster(
         "query_keywords_topk": signature.get("top_keywords", []),
         "query_examples_topk": signature.get("query_examples", []),
     }
+
+    if cfg.include_center_vector:
+        result["center_vector"] = compute_cluster_center_vector(
+            spec=spec,
+            vector_store=vector_store,
+            precision=cfg.center_vector_precision,
+        )
 
     if cfg.include_data_ids:
         result["data_ids"] = list(spec.data_ids)
@@ -999,6 +1138,8 @@ def enrich_row_with_signature(
     row: dict[str, Any],
     spec: ClusterSpec,
     profile_map: dict[str, dict[str, Any]],
+    cfg: Config,
+    vector_store: dict[str, np.ndarray],
 ) -> None:
     signature = build_cluster_signature(spec=spec, profile_map=profile_map)
     matched_count = int(signature.get("matched_count", 0))
@@ -1010,6 +1151,18 @@ def enrich_row_with_signature(
     row["label_distribution_topk"] = signature.get("top_labels", [])
     row["query_keywords_topk"] = signature.get("top_keywords", [])
     row["query_examples_topk"] = signature.get("query_examples", [])
+    if cfg.include_center_vector:
+        has_existing_center = isinstance(row.get("center_vector"), list) and bool(row.get("center_vector"))
+        if vector_store:
+            computed_center = compute_cluster_center_vector(
+                spec=spec,
+                vector_store=vector_store,
+                precision=cfg.center_vector_precision,
+            )
+            if computed_center or not has_existing_center:
+                row["center_vector"] = computed_center
+        elif "center_vector" not in row:
+            row["center_vector"] = []
 
 
 def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -1054,6 +1207,12 @@ def build_config(args: argparse.Namespace) -> Config:
         retry_base_delay=max(0.1, args.retry_base_delay),
         temperature=max(0.0, float(args.temperature)),
         max_tokens=max(32, args.max_tokens),
+        include_center_vector=bool(args.include_center_vector),
+        center_vector_precision=args.center_vector_precision,
+        embedding_model=args.embedding_model,
+        embedding_device=args.embedding_device,
+        embedding_batch_size=max(1, args.embedding_batch_size),
+        force_rebuild_center_vector=bool(args.force_rebuild_center_vector),
         resume=bool(args.resume),
     )
 
@@ -1121,6 +1280,27 @@ def main() -> None:
     pending = [spec for spec in clusters if spec.node_id not in existing]
     logging.info("Pending clusters to process: %d", len(pending))
 
+    vector_store: dict[str, np.ndarray] = {}
+    if cfg.include_center_vector:
+        def has_nonempty_center(row: dict[str, Any]) -> bool:
+            cv = row.get("center_vector")
+            return isinstance(cv, list) and bool(cv)
+
+        need_center_build = bool(
+            cfg.force_rebuild_center_vector
+            or pending
+            or any(not has_nonempty_center(existing.get(spec.node_id, {})) for spec in clusters)
+        )
+        if need_center_build:
+            vector_store = build_profile_vector_store(profile_map=profile_map, clusters=clusters, cfg=cfg)
+            if vector_store:
+                first_dim = len(next(iter(vector_store.values())))
+                logging.info("Centroid vector store ready: ids=%d, dim=%d", len(vector_store), first_dim)
+            if cfg.force_rebuild_center_vector:
+                logging.info("Force center vector rebuild is enabled.")
+        else:
+            logging.info("Skip centroid embedding build: all existing rows already have center_vector.")
+
     if pending and not cfg.api_key:
         raise ValueError(
             "Missing API key. Set --api-key or DEEPSEEK_API_KEY/OPENAI_API_KEY. "
@@ -1135,7 +1315,7 @@ def main() -> None:
     if pending and namer is not None:
         with ThreadPoolExecutor(max_workers=cfg.concurrency) as pool:
             futures: dict[Future[dict[str, Any]], ClusterSpec] = {
-                pool.submit(process_cluster, spec, cfg, profile_map, namer): spec for spec in pending
+                pool.submit(process_cluster, spec, cfg, profile_map, vector_store, namer): spec for spec in pending
             }
 
             iterator = as_completed(futures)
@@ -1165,6 +1345,12 @@ def main() -> None:
                     }
                     if cfg.include_data_ids:
                         row["data_ids"] = list(spec.data_ids)
+                    if cfg.include_center_vector:
+                        row["center_vector"] = compute_cluster_center_vector(
+                            spec=spec,
+                            vector_store=vector_store,
+                            precision=cfg.center_vector_precision,
+                        )
 
                 results_by_node[spec.node_id] = row
                 processed_this_run += 1
@@ -1174,7 +1360,13 @@ def main() -> None:
         row = results_by_node.get(spec.node_id)
         if row is None:
             continue
-        enrich_row_with_signature(row=row, spec=spec, profile_map=profile_map)
+        enrich_row_with_signature(
+            row=row,
+            spec=spec,
+            profile_map=profile_map,
+            cfg=cfg,
+            vector_store=vector_store,
+        )
         ordered_results.append(row)
 
     if not ordered_results:
@@ -1188,6 +1380,13 @@ def main() -> None:
     mapped = sum(1 for r in ordered_results if str(r.get("capability_name", "")).strip())
     with_match = sum(1 for r in ordered_results if int(r.get("matched_profile_count", 0)) > 0)
     refined_name_count = sum(1 for r in ordered_results if r.get("name_refined_from_signature"))
+    center_vector_count = sum(1 for r in ordered_results if isinstance(r.get("center_vector"), list) and r.get("center_vector"))
+    center_vector_dim = 0
+    for r in ordered_results:
+        cv = r.get("center_vector")
+        if isinstance(cv, list) and cv:
+            center_vector_dim = len(cv)
+            break
 
     summary = {
         "tree_json": str(cfg.tree_json),
@@ -1202,6 +1401,8 @@ def main() -> None:
         "cluster_with_name": mapped,
         "cluster_with_error": unresolved,
         "cluster_name_refined_count": refined_name_count,
+        "cluster_with_center_vector": center_vector_count,
+        "center_vector_dim": center_vector_dim,
         "id_linkage": {
             "tree_direct_ids": len(tree_direct_ids),
             "profile_ids": len(profile_ids),
@@ -1218,6 +1419,14 @@ def main() -> None:
             "concurrency": cfg.concurrency,
             "max_retries": cfg.max_retries,
             "timeout": cfg.timeout,
+        },
+        "embedding": {
+            "include_center_vector": cfg.include_center_vector,
+            "center_vector_precision": cfg.center_vector_precision,
+            "embedding_model": cfg.embedding_model,
+            "embedding_device": cfg.embedding_device,
+            "embedding_batch_size": cfg.embedding_batch_size,
+            "force_rebuild_center_vector": cfg.force_rebuild_center_vector,
         },
         "output_jsonl": str(cfg.output_jsonl),
         "generated_at_unix": time.time(),
