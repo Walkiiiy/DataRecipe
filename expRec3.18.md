@@ -887,10 +887,7 @@ python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
   --kmeans-k 12
 
 python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run ours::data/magicoder/exp/dataset_ours.jsonl::data/magicoder/exp/run_ours_shared_eval \
   --run kmeans::data/magicoder/exp/dataset_kmeans.jsonl::data/magicoder/exp/run_kmeans_shared_eval \
-  --run random::data/magicoder/exp/dataset_random.jsonl::data/magicoder/exp/run_random_shared_eval \
-  --run category::data/magicoder/exp/dataset_category.jsonl::data/magicoder/exp/run_category_shared_eval \
   --eval-source-jsonl data/magicoder/train.jsonl \
   --eval-ratio 0.05 \
   --seed 42 \
@@ -899,6 +896,9 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
   --base_model Qwen/Qwen2.5-0.5B-Instruct
 
 
+  --run ours::data/magicoder/exp/dataset_ours.jsonl::data/magicoder/exp/run_ours_shared_eval \
+  --run random::data/magicoder/exp/dataset_random.jsonl::data/magicoder/exp/run_random_shared_eval \
+  --run category::data/magicoder/exp/dataset_category.jsonl::data/magicoder/exp/run_category_shared_eval \
 
 python src/4.1/EXP/visualize_results.py \
   --ours-log-csv data/magicoder/exp/run_ours_shared_eval/train_eval_log.csv \
@@ -1423,11 +1423,13 @@ python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/dolly/
 
 python src/4.1/EXP/data_sampling_by_category.py \
   --profile-jsonl data/dolly/train.jsonl \
+  --category-jsonl data/dolly/train.jsonl \
   --out-dir data/dolly/exp \
   --min-valid-category-size 10 \
   --category-mode proportional \
   --budget-n 1000 \
   --random-seed 42
+
 
 
 
@@ -1450,7 +1452,7 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
   --seed 42 \
   --num_train_epochs 4 \
   --output-root data/dolly/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct
+  --base_model EleutherAI/gpt-neo-125m
   --eval-steps-mode manual \
   --eval_steps 5
 

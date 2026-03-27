@@ -52,7 +52,7 @@ tmp/
 # ------------------------------
 # Project data and artifacts (large)
 # ------------------------------
-/data/
+/data*
 
 # Keep model README if needed, ignore all weights/checkpoints
 /model/*
