@@ -62,18 +62,17 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
 ------------------------------------------------------------------------------------------------
 - delta_improved（用 train_coarse_topk5.jsonl 的 top5 names 构 prompt，输出统一 mapped_vector）
 python3 src/4.2/delta/delta_improved.py \
-  --data_path data/banking77/train.jsonl \
-  --routing_path data/banking77/train_coarse_topk5.jsonl \
-  --output_path data/banking77/score/delta_improved_mapped.jsonl \
+  --data_path data/dialogsum/train.jsonl \
+  --routing_path data/dialogsum/train_coarse_topk5.jsonl \
+  --output_path data/dialogsum/score/delta_improved_mapped.jsonl \
   --concurrency 16 \
   --quality_mode batch \
   --cluster_batch_size 5
 
 python3 /home/walkiiiy/DataRecipe/src/4.2/delta/delta_improved_sample.py \
-  --score_path /home/walkiiiy/DataRecipe/data/banking77/score/delta_improved_mapped.jsonl \
-  --data_path /home/walkiiiy/DataRecipe/data/banking77/train.jsonl \
-  --output_path /home/walkiiiy/DataRecipe/data/banking77/selected/dataset_delta_improved.jsonl \
-  --meta_output_path /home/walkiiiy/DataRecipe/data/banking77/selected/delta_improved_selected_3000_meta.json \
+  --score_path /home/walkiiiy/DataRecipe/data/dialogsum/score/delta_improved_mapped.jsonl \
+  --data_path /home/walkiiiy/DataRecipe/data/dialogsum/train.jsonl \
+  --output_path /home/walkiiiy/DataRecipe/data/dialogsum/selected/dataset_delta_improved.jsonl \
   --num_samples 1000
 
 python src/4.1/EXP/sft_lora_train_shared_eval.py \
@@ -86,7 +85,7 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
   --base_model Qwen/Qwen2.5-0.5B-Instruct 
 ============================================================================
 
-- delta_origin（输出统一 mapped_vector）
+# delta_origin（输出统一 mapped_vector）
 python3 src/4.2/delta/delta_origin.py \
   --data_path data/banking77/train.jsonl \
   --routing_path data/banking77/train_coarse_topk5.jsonl \
@@ -113,7 +112,7 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
 =========================================================================================
 
 
--  alpagasus_origin：原始标量评分（不做能力簇评分）
+#  alpagasus_origin：原始标量评分（不做能力簇评分）
 python3 src/4.2/alpagasus/alpagasus_origin.py \
   --data_path data/banking77/train.jsonl \
   --output_path data/banking77/score/alpagasus_origin_scored.jsonl \
@@ -144,7 +143,7 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
 
 
 
-- alpagasus_improved：保持原评分逻辑 + 映射到能力维向量
+#  alpagasus_improved：保持原评分逻辑 + 映射到能力维向量
 python3 src/4.2/alpagasus/alpagasus_improved.py \
   --data_path data/banking77/train.jsonl \
   --routing_path data/banking77/train_coarse_topk5.jsonl \
@@ -175,10 +174,10 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
   --base_model Qwen/Qwen2.5-0.5B-Instruct 
 
 ================================================================================
-- instag
+# instag
 python3 src/4.2/instag/instag.py \
-  --data_path data/banking77/train.jsonl \
-  --output_path data/banking77/score/instag_tags.jsonl \
+  --data_path data/dialogsum/train.jsonl \
+  --output_path data/dialogsum/score/instag_tags.jsonl \
   --model deepseek-chat \
   --concurrency 16
 
@@ -189,8 +188,8 @@ python3 src/4.2/instag/instag_sample.py \
   --tag_path data/banking77/score/instag_tags.jsonl \
   --output_path data/banking77/exp4.2/dataset_instag.jsonl \
   --num_samples 1000
-
-- MIG
+=======================================================
+# MIG
 - python3 src/4.2/mig/mig.py \
   --data_path data/banking77/train.jsonl \
   --instag_path data/banking77/score/instag_tags.jsonl \

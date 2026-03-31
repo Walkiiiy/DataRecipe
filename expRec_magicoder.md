@@ -45,19 +45,18 @@ export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
 
 
 python3 /home/walkiiiy/DataRecipe/src/4.2/SRM/srm_sample.py \
-  --score_path /home/walkiiiy/DataRecipe/data/banking77/score/srm_from_topk5_only.jsonl \
-  --data_path /home/walkiiiy/DataRecipe/data/banking77/train.jsonl \
-  --output_path /home/walkiiiy/DataRecipe/data/banking77/exp4.2/dataset_srm.jsonl \
-  --meta_output_path /home/walkiiiy/DataRecipe/data/banking77/selected/srm_selected_3000_meta.json \
+  --score_path /home/walkiiiy/DataRecipe/data/magicoder/score/srm_from_topk5_only.jsonl \
+  --data_path /home/walkiiiy/DataRecipe/data/magicoder/train.jsonl \
+  --output_path /home/walkiiiy/DataRecipe/data/magicoder/exp4.2/dataset_srm.jsonl \
   --num_samples 1000
 
 python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run srm::data/banking77/exp4.2/dataset_srm.jsonl::data/banking77/exp4.2/run_srm_shared_eval \
-  --eval-source-jsonl data/banking77/train.jsonl \
+  --run srm::data/magicoder/exp4.2/dataset_srm.jsonl::data/magicoder/exp4.2/run_srm_shared_eval \
+  --eval-source-jsonl data/magicoder/train.jsonl \
   --eval-ratio 0.01 \
   --seed 42 \
   --num_train_epochs 4 \
-  --output-root data/banking77/exp/shared_eval \
+  --output-root data/magicoder/exp/shared_eval \
   --base_model Qwen/Qwen2.5-0.5B-Instruct 
 
 ------------------------------------------------------------------------------------------------

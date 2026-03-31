@@ -1,10 +1,10 @@
-"""Evaluate one or more checkpoints on a sampled set with EM metric.
+"""Evaluate one or more checkpoints on a sampled set with ROUGE-L metric.
 
 Highlights:
 1) Supports pluggable repeated ``--run`` arguments:
    ``--run <name>::<checkpoint_path>``
 2) Builds eval set by random sampling from ``train.jsonl``.
-3) Computes Exact Match (EM) and exports a final CSV summary.
+3) Computes ROUGE-L F1 and exports a final CSV summary.
 4) Supports both LoRA adapter checkpoints and full model checkpoints.
 """
 
@@ -59,7 +59,7 @@ class EvalConfig:
     do_sample: bool
     temperature: float
     top_p: float
-    em_normalize: str
+    text_normalize: str
     save_per_run_jsonl: bool
     continue_on_error: bool
     device: str
@@ -87,7 +87,7 @@ def parse_runs(run_items: list[str]) -> list[EvalRun]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate multiple checkpoints on a sampled set with EM")
+    parser = argparse.ArgumentParser(description="Evaluate multiple checkpoints on a sampled set with ROUGE-L")
     parser.add_argument(
         "--run",
         type=str,
@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
         help="Sample ratio for eval set when --eval-size is not set.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", type=Path, default=Path("data/exp/checkpoint_em_eval"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/exp/checkpoint_rougel_eval"))
     parser.add_argument("--output-csv", type=Path, default=None)
     parser.add_argument(
         "--base_model",
@@ -131,11 +131,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument(
-        "--em-normalize",
+        "--text-normalize",
         type=str,
         choices=["none", "strip", "lower_strip", "squad"],
         default="strip",
-        help="Text normalization mode before EM.",
+        help="Text normalization mode before ROUGE-L.",
+    )
+    parser.add_argument(
+        "--em-normalize",
+        dest="text_normalize",
+        type=str,
+        choices=["none", "strip", "lower_strip", "squad"],
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--save-per-run-jsonl", action="store_true", help="Save per-sample predictions per run.")
     parser.add_argument("--continue-on-error", action="store_true", help="Continue other runs if one run fails.")
@@ -227,7 +235,7 @@ def extract_gold_output(row: dict[str, Any]) -> str:
     return ""
 
 
-def normalize_for_em(text: str, mode: str) -> str:
+def normalize_for_metric(text: str, mode: str) -> str:
     if mode == "none":
         return text
     if mode == "strip":
@@ -242,6 +250,32 @@ def normalize_for_em(text: str, mode: str) -> str:
         text = " ".join(text.strip().split())
         return text
     raise ValueError(f"Unknown normalization mode: {mode}")
+
+
+def rouge_l_f1(pred: str, gold: str) -> float:
+    pred_tokens = pred.split()
+    gold_tokens = gold.split()
+    if not pred_tokens or not gold_tokens:
+        return 0.0
+
+    n = len(gold_tokens)
+    prev = [0] * (n + 1)
+    curr = [0] * (n + 1)
+    for i in range(1, len(pred_tokens) + 1):
+        pi = pred_tokens[i - 1]
+        for j in range(1, n + 1):
+            if pi == gold_tokens[j - 1]:
+                curr[j] = prev[j - 1] + 1
+            else:
+                curr[j] = prev[j] if prev[j] >= curr[j - 1] else curr[j - 1]
+        prev, curr = curr, prev
+
+    lcs = float(prev[n])
+    prec = lcs / float(len(pred_tokens))
+    rec = lcs / float(len(gold_tokens))
+    if prec + rec <= 1e-12:
+        return 0.0
+    return (2.0 * prec * rec) / (prec + rec)
 
 
 def resolve_model_path(model_name_or_path: str, model_source: str, cache_dir: Path | None) -> str:
@@ -450,13 +484,13 @@ def evaluate_run(
                 len(prompts),
             )
 
-    correct = 0
+    rouge_sum = 0.0
     for i, (item, pred) in enumerate(zip(eval_items, preds, strict=True)):
         gold = item["gold"]
-        norm_pred = normalize_for_em(pred, cfg.em_normalize)
-        norm_gold = normalize_for_em(gold, cfg.em_normalize)
-        matched = int(norm_pred == norm_gold)
-        correct += matched
+        norm_pred = normalize_for_metric(pred, cfg.text_normalize)
+        norm_gold = normalize_for_metric(gold, cfg.text_normalize)
+        rouge = rouge_l_f1(norm_pred, norm_gold)
+        rouge_sum += rouge
         details.append(
             {
                 "sample_id": i,
@@ -466,12 +500,12 @@ def evaluate_run(
                 "prediction": pred,
                 "norm_gold": norm_gold,
                 "norm_prediction": norm_pred,
-                "exact_match": matched,
+                "rouge_l_f1": rouge,
             }
         )
 
     total = len(eval_items)
-    em = float(correct / total) if total > 0 else float("nan")
+    rouge_avg = float(rouge_sum / total) if total > 0 else float("nan")
     elapsed = time.time() - t0
 
     summary = {
@@ -480,9 +514,9 @@ def evaluate_run(
         "checkpoint_type": checkpoint_type,
         "base_model_used": base_model_used,
         "eval_size": total,
-        "correct": correct,
-        "em": em,
-        "em_percent": em * 100.0,
+        "rouge_l_f1_sum": rouge_sum,
+        "rouge_l_f1": rouge_avg,
+        "rouge_l_f1_percent": rouge_avg * 100.0,
         "elapsed_sec": elapsed,
         "error": "",
     }
@@ -506,9 +540,9 @@ def save_summary_csv(rows: list[dict[str, Any]], out_csv: Path) -> None:
         "checkpoint_type",
         "base_model_used",
         "eval_size",
-        "correct",
-        "em",
-        "em_percent",
+        "rouge_l_f1_sum",
+        "rouge_l_f1",
+        "rouge_l_f1_percent",
         "elapsed_sec",
         "error",
     ]
@@ -529,7 +563,7 @@ def main() -> None:
     runs = parse_runs(args.run)
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    output_csv = args.output_csv if args.output_csv is not None else (output_dir / "checkpoint_em_results.csv")
+    output_csv = args.output_csv if args.output_csv is not None else (output_dir / "checkpoint_rougel_results.csv")
 
     cfg = EvalConfig(
         runs=runs,
@@ -548,7 +582,7 @@ def main() -> None:
         do_sample=bool(args.do_sample),
         temperature=max(1e-5, float(args.temperature)),
         top_p=max(1e-5, min(1.0, float(args.top_p))),
-        em_normalize=args.em_normalize,
+        text_normalize=args.text_normalize,
         save_per_run_jsonl=bool(args.save_per_run_jsonl),
         continue_on_error=bool(args.continue_on_error),
         device=args.device,
@@ -603,7 +637,7 @@ def main() -> None:
 
     device = resolve_device(cfg.device)
     logging.info("Evaluation device: %s", device)
-    logging.info("Runs=%d | eval_items=%d | normalize=%s", len(cfg.runs), len(eval_items), cfg.em_normalize)
+    logging.info("Runs=%d | eval_items=%d | normalize=%s", len(cfg.runs), len(eval_items), cfg.text_normalize)
 
     summaries: list[dict[str, Any]] = []
     for run in cfg.runs:
@@ -612,11 +646,9 @@ def main() -> None:
             summary, details = evaluate_run(cfg, run, eval_items, device)
             summaries.append(summary)
             logging.info(
-                "[%s] EM=%.4f (%d/%d), elapsed=%.2fs",
+                "[%s] ROUGE-L(F1)=%.4f, elapsed=%.2fs",
                 run.name,
-                summary["em"],
-                summary["correct"],
-                summary["eval_size"],
+                summary["rouge_l_f1"],
                 summary["elapsed_sec"],
             )
             if cfg.save_per_run_jsonl:
@@ -634,16 +666,16 @@ def main() -> None:
                     "checkpoint_type": "",
                     "base_model_used": "",
                     "eval_size": len(eval_items),
-                    "correct": "",
-                    "em": "",
-                    "em_percent": "",
+                    "rouge_l_f1_sum": "",
+                    "rouge_l_f1": "",
+                    "rouge_l_f1_percent": "",
                     "elapsed_sec": "",
                     "error": str(exc),
                 }
             )
 
     save_summary_csv(summaries, cfg.output_csv)
-    with (cfg.output_dir / "checkpoint_em_results.json").open("w", encoding="utf-8") as f:
+    with (cfg.output_dir / "checkpoint_rougel_results.json").open("w", encoding="utf-8") as f:
         json.dump(summaries, f, ensure_ascii=False, indent=2)
     logging.info("Saved summary csv: %s", cfg.output_csv)
     logging.info("Done.")
