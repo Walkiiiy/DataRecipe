@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-eval-count",
         type=int,
-        default=6,
+        default=12,
         help="auto 模式下，目标评估次数（全训练过程）。",
     )
     parser.add_argument(
@@ -406,6 +406,17 @@ def export_logs(log_history: list[dict[str, Any]], out_dir: Path) -> None:
 
 
 def build_training_args(cfg: TrainConfig, output_dir: Path) -> TrainingArguments:
+    eval_steps = 1 if cfg.eval_steps is None else max(1, cfg.eval_steps)
+    save_steps = max(1, cfg.save_steps)
+    if save_steps % eval_steps != 0:
+        logging.warning(
+            "save_steps=%d is not a multiple of eval_steps=%d; override save_steps to eval_steps "
+            "to support reliable best-checkpoint tracking.",
+            save_steps,
+            eval_steps,
+        )
+        save_steps = eval_steps
+
     kwargs: dict[str, Any] = {
         "output_dir": str(output_dir),
         "learning_rate": cfg.learning_rate,
@@ -416,8 +427,8 @@ def build_training_args(cfg: TrainConfig, output_dir: Path) -> TrainingArguments
         "weight_decay": cfg.weight_decay,
         "warmup_ratio": cfg.warmup_ratio,
         "logging_steps": cfg.logging_steps,
-        "eval_steps": 1 if cfg.eval_steps is None else cfg.eval_steps,
-        "save_steps": cfg.save_steps,
+        "eval_steps": eval_steps,
+        "save_steps": save_steps,
         "save_strategy": "steps",
         "logging_strategy": "steps",
         "report_to": [],
@@ -426,7 +437,9 @@ def build_training_args(cfg: TrainConfig, output_dir: Path) -> TrainingArguments
         "gradient_checkpointing": True,
         "seed": cfg.seed,
         "data_seed": cfg.seed,
-        "load_best_model_at_end": False,
+        "load_best_model_at_end": True,
+        "metric_for_best_model": "eval_loss",
+        "greater_is_better": False,
     }
     sig = inspect.signature(TrainingArguments.__init__)
     if "evaluation_strategy" in sig.parameters:
@@ -544,6 +557,13 @@ def train_one_method(
     )
 
     trainer.train()
+    best_ckpt = trainer.state.best_model_checkpoint
+    best_eval_loss = trainer.state.best_metric
+    if best_ckpt:
+        logging.info("[%s] best checkpoint=%s (best eval_loss=%s)", job.name, best_ckpt, best_eval_loss)
+    else:
+        logging.warning("[%s] trainer did not record a best checkpoint.", job.name)
+
     final_metrics = trainer.evaluate()
     trainer.save_model(str(job.output_dir / "final_checkpoint"))
     with (job.output_dir / "final_metrics.json").open("w", encoding="utf-8") as f:
@@ -564,6 +584,8 @@ def train_one_method(
         "train_final_size": len(train_ds),
         "eval_size": len(eval_ds),
         "resolved_eval_steps": resolved_eval_steps,
+        "best_checkpoint": best_ckpt,
+        "best_eval_loss": best_eval_loss,
         "final_metrics": final_metrics,
     }
 

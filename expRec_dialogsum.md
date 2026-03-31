@@ -252,8 +252,8 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
 ===============================================================================================
 - 随机采样
 python src/scripts/sample_train_subset.py \
-  --input-jsonl data/banking77/train.jsonl \
-  --output-jsonl data/banking77/exp4.2/dataset_random.jsonl \
+  --input-jsonl data/dialogsum/train.jsonl \
+  --output-jsonl data/dialogsum/exp4.2/dataset_random.jsonl \
   --sample-size 1000 \
   --seed 42
 
