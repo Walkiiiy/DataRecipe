@@ -1070,7 +1070,7 @@ python src/4.1/stage3_overlapping_incremental_hierarchy.py \
   --log-every 100 \
   --patience-no-1to2-growth 2000 \
   --max-layers 15 \
-  --log-level INFO \
+  --log-level INFO 
 
 python src/4.1/stage4_prune_singleton_tree.py \
   --input-tree-json data/data_ablation/capability_tree_final.json \
@@ -1398,33 +1398,45 @@ python src/4.1/EXP/visualize_results.py \
 
 
 
+# 3.27 stage3的embedding换了Qwen embedding
+
+# clinc150
+export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
+  python src/4.1/stage1_atomic_profile.py \
+  --input data/clinc150/train.jsonl \
+  --output data/clinc150/cdt_profile.jsonl \
+  --max-samples 10000000 \
+  --concurrency 32 \
+  --model deepseek-chat
 
 
-# dolly
 
 python src/4.1/stage3_overlapping_incremental_hierarchy.py \
-  --input-jsonl data/dolly/dolly_cdt_profile.jsonl \
+  --input-jsonl data/clinc150/cdt_profile.jsonl \
   --max-samples 2000 \
-  --d-max 0.8 \
+  --d-max 0.5 \
   --log-every 100 \
   --patience-no-1to2-growth 2000 \
   --max-layers 15 \
   --log-level INFO
 
+0.55   2026-03-27 15:07:56,433 [INFO] Processed=2000 | depth=3 | level_counts={0: 1, 1: 102, 2: 40, 3: 4} | global_J=2060.633912 | no_1to2_streak=81
+0.5    2026-03-27 15:15:13,741 [INFO] Processed=2000 | depth=2 | level_counts={0: 1, 1: 222, 2: 4} | global_J=2157.432189 | no_1to2_streak=9
+
 python src/4.1/stage4_prune_singleton_tree.py \
-  --input-tree-json data/dolly/capability_tree_final.json \
-  --output-tree-json data/dolly/capability_tree_final_pruned.json \
-  --output-summary-json data/dolly/capability_tree_summary_pruned.json 
+  --input-tree-json data/clinc150/capability_tree_final.json \
+  --output-tree-json data/clinc150/capability_tree_final_pruned.json \
+  --output-summary-json data/clinc150/capability_tree_summary_pruned.json 
 
 
-python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/dolly/capability_tree_final_pruned.json   --profile-jsonl data/dolly/dolly_cdt_profile.jsonl   --out-dir data/dolly/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/clinc150/capability_tree_final_pruned.json   --profile-jsonl data/clinc150/cdt_profile.jsonl   --out-dir data/clinc150/exp   --min-valid-cluster-size 5   --random-seed 42 --budget-n 1000
 
 
 
 python src/4.1/EXP/data_sampling_by_category.py \
-  --profile-jsonl data/dolly/train.jsonl \
-  --category-jsonl data/dolly/train.jsonl \
-  --out-dir data/dolly/exp \
+  --profile-jsonl data/clinc150/train.jsonl \
+  --category-jsonl data/clinc150/train.jsonl \
+  --out-dir data/clinc150/exp \
   --min-valid-category-size 10 \
   --category-mode proportional \
   --budget-n 1000 \
@@ -1432,34 +1444,182 @@ python src/4.1/EXP/data_sampling_by_category.py \
 
 
 
-
 python src/4.1/baseline_Kmeans_clustering.py \
-  --input-jsonl data/dolly/train.jsonl
+  --input-jsonl data/clinc150/train.jsonl
 
 python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
-  --profile-jsonl data/dolly/dolly_cdt_profile.jsonl \
-  --out-dir data/dolly/exp \
+  --profile-jsonl data/clinc150/cdt_profile.jsonl \
+  --out-dir data/clinc150/exp \
   --budget-n 1000 \
-  --kmeans-k 7
+  --kmeans-k 125
+
 
 python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run ours::data/dolly/exp/dataset_ours.jsonl::data/dolly/exp/run_ours_shared_eval \
-  --run kmeans::data/dolly/exp/dataset_kmeans.jsonl::data/dolly/exp/run_kmeans_shared_eval \
-  --run random::data/dolly/exp/dataset_random.jsonl::data/dolly/exp/run_random_shared_eval \
-  --run category::data/dolly/exp/dataset_category.jsonl::data/dolly/exp/run_category_shared_eval \
-  --eval-source-jsonl data/dolly/train.jsonl \
+  --run ours::data/clinc150/exp/dataset_ours.jsonl::data/clinc150/exp/run_ours_shared_eval \
+  --run kmeans::data/clinc150/exp/dataset_kmeans.jsonl::data/clinc150/exp/run_kmeans_shared_eval \
+  --run random::data/clinc150/exp/dataset_random.jsonl::data/clinc150/exp/run_random_shared_eval \
+  --run category::data/clinc150/exp/dataset_category.jsonl::data/clinc150/exp/run_category_shared_eval \
+  --eval-source-jsonl data/clinc150/train.jsonl \
   --eval-ratio 0.05 \
   --seed 42 \
   --num_train_epochs 4 \
-  --output-root data/dolly/exp/shared_eval \
-  --base_model EleutherAI/gpt-neo-125m
+  --output-root data/clinc150/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct
   --eval-steps-mode manual \
   --eval_steps 5
 
 
+
 python src/4.1/EXP/visualize_results.py \
-  --ours-log-csv data/dolly/exp/run_ours_shared_eval/train_eval_log.csv \
-  --kmeans-log-csv data/dolly/exp/run_kmeans_shared_eval/train_eval_log.csv \
-  --random-log-csv data/dolly/exp/run_random_shared_eval/train_eval_log.csv \
-  --category-log-csv data/dolly/exp/run_category_shared_eval/train_eval_log.csv \
-  --out-dir data/dolly/exp/figures
+  --ours-log-csv data/clinc150/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/clinc150/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/clinc150/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/clinc150/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/clinc150/exp/figures
+
+
+不行
+
+
+# sciq 
+
+export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
+  python src/4.1/stage1_atomic_profile.py \
+  --input data/sciq/train.jsonl \
+  --output data/sciq/cdt_profile.jsonl \
+  --max-samples 10000000 \
+  --concurrency 32 \
+  --model deepseek-chat
+
+
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/sciq/cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 1 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/sciq/capability_tree_final.json \
+  --output-tree-json data/sciq/capability_tree_final_pruned.json \
+  --output-summary-json data/sciq/capability_tree_summary_pruned.json 
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/sciq/capability_tree_final_pruned.json   --profile-jsonl data/sciq/cdt_profile.jsonl   --out-dir data/sciq/exp   --min-valid-cluster-size 2   --random-seed 42 --budget-n 1000
+
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/sciq/train.jsonl \
+  --category-jsonl data/sciq/train.jsonl \
+  --out-dir data/sciq/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/sciq/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/sciq/train.jsonl \
+  --out-dir data/sciq/exp \
+  --budget-n 1000 \
+  --kmeans-k 9
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/sciq/exp/dataset_ours.jsonl::data/sciq/exp/run_ours_shared_eval \
+  --run kmeans::data/sciq/exp/dataset_kmeans.jsonl::data/sciq/exp/run_kmeans_shared_eval \
+  --eval-source-jsonl data/sciq/train.jsonl \
+  --eval-ratio 0.01 \
+  --seed 42 \
+  --num_train_epochs 8 \
+  --output-root data/sciq/exp/shared_eval \
+  --base_model EleutherAI/gpt-neo-125m \
+  --eval-steps-mode manual \
+  --eval_steps 10
+
+
+  --run random::data/sciq/exp/dataset_random.jsonl::data/sciq/exp/run_random_shared_eval \
+  --run category::data/sciq/exp/dataset_category.jsonl::data/sciq/exp/run_category_shared_eval \
+
+
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/sciq/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/sciq/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/sciq/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/sciq/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/sciq/exp/figures
+
+# gsm
+
+
+python src/4.1/stage3_overlapping_incremental_hierarchy.py \
+  --input-jsonl data/gsm/cdt_profile.jsonl \
+  --max-samples 2000 \
+  --d-max 0.9 \
+  --log-every 100 \
+  --patience-no-1to2-growth 2000 \
+  --max-layers 15 \
+  --log-level INFO
+
+python src/4.1/stage4_prune_singleton_tree.py \
+  --input-tree-json data/gsm/capability_tree_final.json \
+  --output-tree-json data/gsm/capability_tree_final_pruned.json \
+  --output-summary-json data/gsm/capability_tree_summary_pruned.json 
+
+
+python src/4.1/EXP/data_sampling_by_capability_tree.py   --tree-json data/gsm/capability_tree_final_pruned.json   --profile-jsonl data/gsm/cdt_profile.jsonl   --out-dir data/gsm/exp   --min-valid-cluster-size 2   --random-seed 42 --budget-n 1000
+
+
+
+python src/4.1/EXP/data_sampling_by_category.py \
+  --profile-jsonl data/gsm/train.jsonl \
+  --category-jsonl data/gsm/train.jsonl \
+  --out-dir data/gsm/exp \
+  --min-valid-category-size 10 \
+  --category-mode proportional \
+  --budget-n 1000 \
+  --random-seed 42
+
+
+
+python src/4.1/baseline_Kmeans_clustering.py \
+  --input-jsonl data/gsm/train.jsonl
+
+python src/4.1/EXP/data_sampling_by_random_and_kmeans.py \
+  --profile-jsonl data/gsm/train.jsonl \
+  --out-dir data/gsm/exp \
+  --budget-n 1000 \
+  --kmeans-k 4
+
+python src/4.1/EXP/sft_lora_train_shared_eval.py \
+  --run ours::data/gsm/exp/dataset_ours.jsonl::data/gsm/exp/run_ours_shared_eval \
+  --eval-source-jsonl data/gsm/train.jsonl \
+  --eval-ratio 0.01 \
+  --seed 42 \
+  --num_train_epochs 4 \
+  --output-root data/gsm/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B-Instruct \
+  --eval-steps-mode manual \
+  --eval_steps 10
+
+  --run kmeans::data/gsm/exp/dataset_kmeans.jsonl::data/gsm/exp/run_kmeans_shared_eval \
+  --run random::data/gsm/exp/dataset_random.jsonl::data/gsm/exp/run_random_shared_eval \
+  --run category::data/gsm/exp/dataset_category.jsonl::data/gsm/exp/run_category_shared_eval \
+
+
+
+
+python src/4.1/EXP/visualize_results.py \
+  --ours-log-csv data/gsm/exp/run_ours_shared_eval/train_eval_log.csv \
+  --kmeans-log-csv data/gsm/exp/run_kmeans_shared_eval/train_eval_log.csv \
+  --random-log-csv data/gsm/exp/run_random_shared_eval/train_eval_log.csv \
+  --category-log-csv data/gsm/exp/run_category_shared_eval/train_eval_log.csv \
+  --out-dir data/gsm/exp/figures

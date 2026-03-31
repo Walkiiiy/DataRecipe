@@ -607,6 +607,7 @@ def parse_args() -> argparse.Namespace:
         help="最终统计信息输出路径",
     )
     parser.add_argument("--embedding-model", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
+    # parser.add_argument("--embedding-model", type=str, default="Qwen/Qwen3-Embedding-0.6B")
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-samples", type=int, default=1000, help="-1 for full dataset")
     parser.add_argument("--max-layers", type=int, default=30, help="能力树最大层数（root=1）；最底层仅允许 Merge。")

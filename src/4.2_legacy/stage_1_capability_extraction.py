@@ -289,6 +289,7 @@ class Config:
     embedding_batch_size: int
     force_rebuild_center_vector: bool
     resume: bool
+    print_named_tree: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -365,6 +366,12 @@ def parse_args() -> argparse.Namespace:
         help="Force rebuild center_vector for all clusters (useful when switching embedding model).",
     )
     parser.add_argument("--resume", action="store_true", help="Skip node_id already existing in output jsonl.")
+    parser.add_argument(
+        "--print-named-tree",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print tree structure to CLI after main flow, using processed cluster names.",
+    )
     parser.add_argument("--log-level", type=str, default="INFO")
     return parser.parse_args()
 
@@ -1172,6 +1179,59 @@ def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def display_cluster_name(row: dict[str, Any]) -> str:
+    zh = clean_text(row.get("capability_name_zh"))
+    en = clean_text(row.get("capability_name"))
+    if zh and en and zh != en:
+        return f"{zh} | {en}"
+    if zh:
+        return zh
+    if en:
+        return en
+    return "未命名簇"
+
+
+def build_named_tree_lines(
+    tree: dict[str, Any],
+    named_rows_by_node: dict[str, dict[str, Any]],
+) -> list[str]:
+    lines: list[str] = []
+
+    def walk(node: dict[str, Any], prefix: str, is_last: bool, is_root: bool = False) -> None:
+        node_id = str(node.get("node_id", "UNKNOWN"))
+        named_row = named_rows_by_node.get(node_id)
+        if named_row is not None:
+            label = f"{display_cluster_name(named_row)} [{node_id}]"
+        else:
+            label = f"[{node_id}]"
+
+        if is_root:
+            lines.append(label)
+        else:
+            connector = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{connector}{label}")
+
+        children = node.get("children", []) or []
+        next_prefix = prefix + ("    " if is_last else "│   ")
+        for i, child in enumerate(children):
+            walk(child, next_prefix, i == len(children) - 1, False)
+
+    walk(tree, prefix="", is_last=True, is_root=True)
+    return lines
+
+
+def print_named_tree_to_cli(tree: dict[str, Any], rows: list[dict[str, Any]]) -> None:
+    by_node = {
+        str(row.get("node_id", "")).strip(): row
+        for row in rows
+        if str(row.get("node_id", "")).strip()
+    }
+    lines = build_named_tree_lines(tree=tree, named_rows_by_node=by_node)
+    print("\n=== Capability Tree (Named Clusters) ===")
+    for ln in lines:
+        print(ln)
+
+
 def build_config(args: argparse.Namespace) -> Config:
     tree_json = args.tree_json
     profile_jsonl = args.profile_jsonl
@@ -1214,6 +1274,7 @@ def build_config(args: argparse.Namespace) -> Config:
         embedding_batch_size=max(1, args.embedding_batch_size),
         force_rebuild_center_vector=bool(args.force_rebuild_center_vector),
         resume=bool(args.resume),
+        print_named_tree=bool(args.print_named_tree),
     )
 
 
@@ -1436,6 +1497,9 @@ def main() -> None:
     with cfg.output_summary_json.open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     logging.info("Saved summary: %s", cfg.output_summary_json)
+
+    if cfg.print_named_tree:
+        print_named_tree_to_cli(tree=tree, rows=ordered_results)
 
 
 if __name__ == "__main__":

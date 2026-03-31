@@ -11,7 +11,7 @@ For each sample x:
   2) Parse per-candidate gate W_llm in {0, w, 1}
   3) Late fusion: v_{x,k} = S_emb^(k) * W_llm^(k)
 
-Output is dense mapped_vector over m dimensions.
+Output is sparse/dense mapped_vector over m dimensions.
 """
 
 from __future__ import annotations
@@ -63,9 +63,6 @@ class RoutedItem:
     text: str
     top_k_indices: list[int]
     top_k_scores: list[float]
-    top_k_node_ids: list[str] | None = None
-    top_k_node_names: list[str] | None = None
-    top_k_node_paths: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -92,14 +89,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--capabilities_path",
         type=Path,
-        default=None,
-        help="Optional capability descriptions path (.json or .jsonl). If omitted, build candidate texts from routing row metadata.",
+        required=True,
+        help="Capability descriptions path (.json or .jsonl).",
     )
     parser.add_argument(
         "--m_dimensions",
         type=int,
         default=None,
-        help="Total capability dimension m. If omitted, infer as max(capabilities, routed indices).",
+        help="Total capability dimension m. If omitted, infer from --capabilities_path.",
     )
     parser.add_argument(
         "--data_path",
@@ -118,12 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retry_base_delay", type=float, default=1.0)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tokens", type=int, default=64)
-    parser.add_argument(
-        "--dense_output",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Deprecated. Dense vector output is always used; --no-dense_output is ignored.",
-    )
+    parser.add_argument("--dense_output", action="store_true", help="Write dense vector of length m instead of sparse dict.")
     parser.add_argument("--include_debug_fields", action="store_true")
     parser.add_argument("--log_level", type=str, default="INFO")
     return parser.parse_args()
@@ -197,25 +189,6 @@ def parse_top_k_list(row: dict[str, Any], key: str) -> list[Any]:
     return val
 
 
-def parse_optional_top_k_list(row: dict[str, Any], key: str, expected_len: int, row_index: int) -> list[Any] | None:
-    if key not in row or row.get(key) is None:
-        return None
-    val = row.get(key)
-    if not isinstance(val, list):
-        logging.warning("Ignore invalid optional field %s at routed row=%d (not a list).", key, row_index)
-        return None
-    if len(val) != expected_len:
-        logging.warning(
-            "Ignore optional field %s at routed row=%d due to length mismatch: got=%d, expected=%d.",
-            key,
-            row_index,
-            len(val),
-            expected_len,
-        )
-        return None
-    return val
-
-
 def load_routed_items(input_path: Path, text_map: dict[str, str]) -> list[RoutedItem]:
     rows = load_jsonl(input_path)
     items: list[RoutedItem] = []
@@ -228,9 +201,6 @@ def load_routed_items(input_path: Path, text_map: dict[str, str]) -> list[Routed
 
         top_k_indices = [int(x) for x in top_k_indices_raw]
         top_k_scores = [float(x) for x in top_k_scores_raw]
-        top_k_node_ids_raw = parse_optional_top_k_list(row, "top_k_node_ids", len(top_k_indices), i)
-        top_k_node_names_raw = parse_optional_top_k_list(row, "top_k_node_names", len(top_k_indices), i)
-        top_k_node_paths_raw = parse_optional_top_k_list(row, "top_k_node_paths", len(top_k_indices), i)
 
         text = clean_text(row.get("text"))
         if not text:
@@ -248,21 +218,9 @@ def load_routed_items(input_path: Path, text_map: dict[str, str]) -> list[Routed
                 text=text,
                 top_k_indices=top_k_indices,
                 top_k_scores=top_k_scores,
-                top_k_node_ids=[clean_text(x) for x in top_k_node_ids_raw] if top_k_node_ids_raw is not None else None,
-                top_k_node_names=[clean_text(x) for x in top_k_node_names_raw] if top_k_node_names_raw is not None else None,
-                top_k_node_paths=[clean_text(x) for x in top_k_node_paths_raw] if top_k_node_paths_raw is not None else None,
             )
         )
     return items
-
-
-def infer_m_dimensions_from_routed_items(items: list[RoutedItem]) -> int:
-    max_idx = -1
-    for item in items:
-        for idx in item.top_k_indices:
-            if idx > max_idx:
-                max_idx = idx
-    return max_idx + 1 if max_idx >= 0 else 0
 
 
 def build_capability_text(obj: dict[str, Any], idx: int) -> str:
@@ -294,24 +252,19 @@ def build_capability_text(obj: dict[str, Any], idx: int) -> str:
     return "\n".join(lines)
 
 
-def load_capabilities_jsonl(path: Path, m: int) -> tuple[list[str], dict[str, int]]:
+def load_capabilities_jsonl(path: Path, m: int) -> list[str]:
     desc = [f"Capability Index: {i}" for i in range(m)]
-    node_id_to_index: dict[str, int] = {}
     rows = load_jsonl(path)
     for line_idx, obj in enumerate(rows):
         idx = int(obj.get("order", line_idx))
         if idx < 0 or idx >= m:
             continue
         desc[idx] = build_capability_text(obj, idx)
-        node_id = clean_text(obj.get("node_id"))
-        if node_id:
-            node_id_to_index[node_id] = idx
-    return desc, node_id_to_index
+    return desc
 
 
-def load_capabilities_json(path: Path, m: int) -> tuple[list[str], dict[str, int]]:
+def load_capabilities_json(path: Path, m: int) -> list[str]:
     desc = [f"Capability Index: {i}" for i in range(m)]
-    node_id_to_index: dict[str, int] = {}
     obj = json.loads(path.read_text(encoding="utf-8"))
 
     if isinstance(obj, list):
@@ -320,12 +273,9 @@ def load_capabilities_json(path: Path, m: int) -> tuple[list[str], dict[str, int
                 idx = int(item.get("index", item.get("order", i)))
                 if 0 <= idx < m:
                     desc[idx] = build_capability_text(item, idx)
-                    node_id = clean_text(item.get("node_id"))
-                    if node_id:
-                        node_id_to_index[node_id] = idx
             elif isinstance(item, str) and i < m:
                 desc[i] = f"Capability Index: {i}\nDescription: {item}"
-        return desc, node_id_to_index
+        return desc
 
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -337,17 +287,14 @@ def load_capabilities_json(path: Path, m: int) -> tuple[list[str], dict[str, int
                 continue
             if isinstance(v, dict):
                 desc[idx] = build_capability_text(v, idx)
-                node_id = clean_text(v.get("node_id"))
-                if node_id:
-                    node_id_to_index[node_id] = idx
             else:
                 desc[idx] = f"Capability Index: {idx}\nDescription: {clean_text(v)}"
-        return desc, node_id_to_index
+        return desc
 
     raise ValueError(f"Unsupported json structure in capabilities file: {path}")
 
 
-def load_capabilities(capabilities_path: Path, m: int) -> tuple[list[str], dict[str, int]]:
+def load_capabilities(capabilities_path: Path, m: int) -> list[str]:
     suffix = capabilities_path.suffix.lower()
     if suffix == ".jsonl":
         return load_capabilities_jsonl(capabilities_path, m)
@@ -640,78 +587,19 @@ async def run_verification(
         return await asyncio.gather(*coros)
 
 
-def routed_fallback_capability_text(item: RoutedItem, rank: int, mapped_idx: int) -> str:
-    lines = [f"Capability Index: {mapped_idx}"]
-    if item.top_k_node_ids is not None and rank < len(item.top_k_node_ids):
-        node_id = clean_text(item.top_k_node_ids[rank])
-        if node_id:
-            lines.append(f"Node ID: {node_id}")
-    if item.top_k_node_names is not None and rank < len(item.top_k_node_names):
-        name = clean_text(item.top_k_node_names[rank])
-        if name:
-            lines.append(f"Name (EN): {name}")
-    if item.top_k_node_paths is not None and rank < len(item.top_k_node_paths):
-        path = clean_text(item.top_k_node_paths[rank])
-        if path:
-            lines.append(f"Tree Path: {path}")
-    lines.append("Definition: Derived from coarse routing metadata.")
-    return "\n".join(lines)
-
-
-def build_jobs(
-    items: list[RoutedItem],
-    capabilities: list[str] | None,
-    m: int,
-    node_id_to_index: dict[str, int] | None,
-) -> list[VerifyItemJob]:
-    node_id_map = node_id_to_index or {}
-    use_capability_file = capabilities is not None
+def build_jobs(items: list[RoutedItem], capabilities: list[str], m: int) -> list[VerifyItemJob]:
     jobs: list[VerifyItemJob] = []
     j = 0
-    mapped_by_node_id = 0
-    missing_node_id_mapping = 0
-    fallback_to_index = 0
-    dropped_invalid_index = 0
-    routed_text_only = 0
     for item in items:
         cap_indices: list[int] = []
         cap_scores: list[float] = []
         cap_texts: list[str] = []
-        use_node_id = use_capability_file and item.top_k_node_ids is not None and len(item.top_k_node_ids) == len(item.top_k_indices)
-        for rank, (cap_idx, score) in enumerate(zip(item.top_k_indices, item.top_k_scores)):
-            mapped_idx: int | None = None
-            used_fallback_text = False
-            if use_capability_file and use_node_id:
-                node_id = clean_text(item.top_k_node_ids[rank])
-                if node_id:
-                    mapped_idx = node_id_map.get(node_id)
-                if mapped_idx is None:
-                    missing_node_id_mapping += 1
-                    if cap_idx < 0 or cap_idx >= m:
-                        dropped_invalid_index += 1
-                        continue
-                    mapped_idx = cap_idx
-                    fallback_to_index += 1
-                    used_fallback_text = True
-                else:
-                    mapped_by_node_id += 1
-            else:
-                if cap_idx < 0 or cap_idx >= m:
-                    dropped_invalid_index += 1
-                    continue
-                mapped_idx = cap_idx
-                fallback_to_index += 1
-                if not use_capability_file:
-                    used_fallback_text = True
-
-            cap_indices.append(mapped_idx)
+        for cap_idx, score in zip(item.top_k_indices, item.top_k_scores):
+            if cap_idx < 0 or cap_idx >= m:
+                continue
+            cap_indices.append(cap_idx)
             cap_scores.append(float(score))
-            if used_fallback_text or not use_capability_file:
-                cap_texts.append(routed_fallback_capability_text(item, rank, mapped_idx))
-                routed_text_only += 1
-            else:
-                assert capabilities is not None
-                cap_texts.append(capabilities[mapped_idx])
+            cap_texts.append(capabilities[cap_idx])
 
         jobs.append(
             VerifyItemJob(
@@ -725,14 +613,6 @@ def build_jobs(
             )
         )
         j += 1
-    logging.info(
-        "Job mapping stats: mapped_by_node_id=%d, fallback_to_index=%d, missing_node_id_mapping=%d, dropped_invalid_index=%d, routed_text_only=%d",
-        mapped_by_node_id,
-        fallback_to_index,
-        missing_node_id_mapping,
-        dropped_invalid_index,
-        routed_text_only,
-    )
     return jobs
 
 
@@ -747,15 +627,11 @@ def fuse_results(
     if len(jobs) != len(results):
         raise ValueError("jobs/results length mismatch")
 
-    if not dense_output:
-        logging.warning("Sparse output mode is deprecated and ignored; forcing dense output.")
-
-    per_row_dense: list[list[float]] = [[0.0] * m for _ in items]
+    per_row_dense: list[list[float] | None] = [([0.0] * m if dense_output else None) for _ in items]
+    per_row_sparse: list[dict[str, float] | None] = [({} if not dense_output else None) for _ in items]
     per_row_rel: list[list[str]] = [[] for _ in items]
     per_row_gate: list[list[float]] = [[] for _ in items]
     per_row_fused: list[list[float]] = [[] for _ in items]
-    per_row_used_indices: list[list[int]] = [[] for _ in items]
-    per_row_used_scores: list[list[float]] = [[] for _ in items]
 
     for job, res in zip(jobs, results):
         row_idx = job.row_index
@@ -764,10 +640,14 @@ def fuse_results(
             rel = str(res.relations[rank]) if rank < len(res.relations) else REL_NONE
             fused = float(emb_score) * gate
 
-            per_row_dense[row_idx][cap_idx] += fused
-
-            per_row_used_indices[row_idx].append(int(cap_idx))
-            per_row_used_scores[row_idx].append(float(emb_score))
+            if dense_output:
+                assert per_row_dense[row_idx] is not None
+                per_row_dense[row_idx][cap_idx] += fused
+            else:
+                assert per_row_sparse[row_idx] is not None
+                if fused != 0.0:
+                    key = str(cap_idx)
+                    per_row_sparse[row_idx][key] = float(per_row_sparse[row_idx].get(key, 0.0) + fused)
 
             if include_debug:
                 per_row_rel[row_idx].append(rel)
@@ -776,24 +656,19 @@ def fuse_results(
 
     out: list[dict[str, Any]] = []
     for i, item in enumerate(items):
-        mapped_vector: list[float] = per_row_dense[i]
+        mapped_vector: Any
+        if dense_output:
+            mapped_vector = per_row_dense[i]
+        else:
+            mapped_vector = per_row_sparse[i]
 
         row = {
             "id": item.sample_id,
             "mapped_vector": mapped_vector,
-            "score": mapped_vector,
         }
         if include_debug:
-            row["top_k_indices"] = per_row_used_indices[i]
-            row["top_k_scores"] = per_row_used_scores[i]
-            row["raw_top_k_indices"] = item.top_k_indices
-            row["raw_top_k_scores"] = item.top_k_scores
-            if item.top_k_node_ids is not None:
-                row["top_k_node_ids"] = item.top_k_node_ids
-            if item.top_k_node_names is not None:
-                row["top_k_node_names"] = item.top_k_node_names
-            if item.top_k_node_paths is not None:
-                row["top_k_node_paths"] = item.top_k_node_paths
+            row["top_k_indices"] = item.top_k_indices
+            row["top_k_scores"] = item.top_k_scores
             row["llm_relations"] = per_row_rel[i]
             row["llm_gates"] = per_row_gate[i]
             row["fused_top_k"] = per_row_fused[i]
@@ -813,17 +688,14 @@ async def async_main(args: argparse.Namespace) -> None:
         raise ValueError("--damping_w should be in [0, 1]")
     if args.max_retries <= 0:
         raise ValueError("--max_retries must be > 0")
-    if not args.dense_output:
-        logging.warning("--no-dense_output is deprecated and ignored; forcing dense output.")
 
     endpoint = normalize_endpoint(args.base_url)
     data_path = args.data_path or infer_data_path(args.input_path)
-    capabilities_path: Path | None = args.capabilities_path
 
     if not args.input_path.exists():
         raise FileNotFoundError(f"input_path not found: {args.input_path}")
-    if capabilities_path is not None and not capabilities_path.exists():
-        raise FileNotFoundError(f"capabilities_path not found: {capabilities_path}")
+    if not args.capabilities_path.exists():
+        raise FileNotFoundError(f"capabilities_path not found: {args.capabilities_path}")
     if not data_path.exists():
         raise FileNotFoundError(f"data_path not found: {data_path}")
 
@@ -832,43 +704,24 @@ async def async_main(args: argparse.Namespace) -> None:
     logging.info("Loading routed candidates: %s", args.input_path)
     items = load_routed_items(args.input_path, text_map=text_map)
 
-    inferred_m_cap = infer_m_dimensions(capabilities_path) if capabilities_path is not None else 0
-    inferred_m_routed = infer_m_dimensions_from_routed_items(items)
-    inferred_m = max(inferred_m_cap, inferred_m_routed)
+    inferred_m = infer_m_dimensions(args.capabilities_path)
     if args.m_dimensions is None:
         m_dimensions = inferred_m
-        logging.info(
-            "m_dimensions inferred: max(capabilities=%d, routed=%d) => %d",
-            inferred_m_cap,
-            inferred_m_routed,
-            m_dimensions,
-        )
+        logging.info("m_dimensions inferred from capabilities: %d", m_dimensions)
     else:
         if args.m_dimensions <= 0:
             raise ValueError("--m_dimensions must be > 0")
         m_dimensions = int(args.m_dimensions)
-        if m_dimensions < inferred_m_cap or m_dimensions < inferred_m_routed:
+        if m_dimensions != inferred_m:
             raise ValueError(
-                f"--m_dimensions={m_dimensions} is too small; requires >= max(capabilities={inferred_m_cap}, routed={inferred_m_routed})."
+                f"--m_dimensions={m_dimensions} mismatches inferred capability dimension={inferred_m} "
+                f"from {args.capabilities_path}"
             )
 
-    capabilities: list[str] | None = None
-    node_id_to_index: dict[str, int] | None = None
-    if capabilities_path is not None:
-        logging.info("Loading capability descriptions: %s", capabilities_path)
-        capabilities, node_id_to_index = load_capabilities(capabilities_path, m=m_dimensions)
-        logging.info("Capability node-id mapping loaded: %d entries", len(node_id_to_index))
-    else:
-        logging.info(
-            "No --capabilities_path provided; candidate texts will be built from routed metadata only (node_id/name/path)."
-        )
+    logging.info("Loading capability descriptions: %s", args.capabilities_path)
+    capabilities = load_capabilities(args.capabilities_path, m=m_dimensions)
 
-    jobs = build_jobs(
-        items=items,
-        capabilities=capabilities,
-        m=m_dimensions,
-        node_id_to_index=node_id_to_index,
-    )
+    jobs = build_jobs(items=items, capabilities=capabilities, m=m_dimensions)
     logging.info(
         "SRM verification jobs prepared: samples=%d, requests=%d (1 request/sample), endpoint=%s, model=%s, concurrency=%d",
         len(items),

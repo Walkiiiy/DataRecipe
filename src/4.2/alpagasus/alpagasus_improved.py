@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import json
 import logging
-import math
 import os
 import re
 import threading
@@ -17,6 +16,8 @@ try:
 except ImportError:
     tqdm = None
 
+
+SYSTEM_PROMPT = "You are a helpful assistant."
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,53 +34,26 @@ class RoutedItem:
     top_k_node_paths: List[str]
 
 
-class DeepSeekDeltaScorer:
-    """DEITA delta scorer with DeepSeek API backend.
+class DeepSeekAlpagasusVectorScorer:
+    """Alpagasus scorer with capability-dimension vector mapping.
 
-    Origin scalar delta is preserved as `delta_scalar`, and then mapped into an
-    m-dim capability vector using routed top-k indices.
+    Core yes/no judge scoring logic is unchanged from origin script.
     """
-
-    complexity_template = (
-        "You are a strict grader.\n"
-        "Evaluate the complexity of the following user query on a 1-6 scale.\n"
-        "Return ONLY one digit: 1, 2, 3, 4, 5, or 6.\n"
-        "No words, no explanation, no markdown, no punctuation.\n"
-        "##Query: {instruction}\n"
-        "##Complexity:"
-    )
-
-    quality_template = (
-        "You are a strict grader.\n"
-        "Evaluate the response quality for the given question on a 1-6 scale.\n"
-        "Return ONLY one digit: 1, 2, 3, 4, 5, or 6.\n"
-        "No words, no explanation, no markdown, no punctuation.\n"
-        "#Question#:\n"
-        "{instruction}\n"
-        "#Response#:\n"
-        "{output}\n"
-        "##Quality:"
-    )
-
-    score_template = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 
     def __init__(
         self,
         api_key: str,
         model: str = "deepseek-chat",
         base_url: str = "https://api.deepseek.com",
-        request_timeout: int = 60,
-        max_retries: int = 5,
-        retry_backoff: float = 1.5,
+        request_timeout: int = 120,
+        max_retries: int = 3,
+        retry_sleep: float = 2.0,
     ) -> None:
-        if not api_key:
-            raise ValueError("DeepSeek API key is required. Set --api_key or DEEPSEEK_API_KEY.")
-
         self.api_key = api_key
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
-        self.retry_backoff = retry_backoff
+        self.retry_sleep = retry_sleep
 
         self.endpoint = self._normalize_endpoint(base_url)
         self._thread_local = threading.local()
@@ -97,14 +71,6 @@ class DeepSeekDeltaScorer:
         if base.endswith("/chat/completions"):
             return base
         return f"{base}/chat/completions"
-
-    @staticmethod
-    def _softmax(values: List[float]) -> List[float]:
-        max_logit = max(values)
-        shifted = [v - max_logit for v in values]
-        exp_logits = [math.exp(v) for v in shifted]
-        exp_sum = sum(exp_logits)
-        return [v / exp_sum for v in exp_logits]
 
     @staticmethod
     def _to_int(value: Any, default: int) -> int:
@@ -185,9 +151,9 @@ class DeepSeekDeltaScorer:
                 if max_top_k > 0:
                     limit = min(limit, max_top_k)
 
-                top_k_node_ids_raw = DeepSeekDeltaScorer._extract_optional_list(row, "top_k_node_ids")
-                top_k_node_names_raw = DeepSeekDeltaScorer._extract_optional_list(row, "top_k_node_names")
-                top_k_node_paths_raw = DeepSeekDeltaScorer._extract_optional_list(row, "top_k_node_paths")
+                top_k_node_ids_raw = DeepSeekAlpagasusVectorScorer._extract_optional_list(row, "top_k_node_ids")
+                top_k_node_names_raw = DeepSeekAlpagasusVectorScorer._extract_optional_list(row, "top_k_node_names")
+                top_k_node_paths_raw = DeepSeekAlpagasusVectorScorer._extract_optional_list(row, "top_k_node_paths")
 
                 top_k_indices: List[int] = []
                 top_k_scores: List[float] = []
@@ -196,10 +162,10 @@ class DeepSeekDeltaScorer:
                 top_k_node_paths: List[str] = []
 
                 for rank in range(limit):
-                    idx = DeepSeekDeltaScorer._to_int(top_k_indices_raw[rank], -1)
+                    idx = DeepSeekAlpagasusVectorScorer._to_int(top_k_indices_raw[rank], -1)
                     if idx < 0:
                         continue
-                    score = DeepSeekDeltaScorer._to_float(top_k_scores_raw[rank], 0.0)
+                    score = DeepSeekAlpagasusVectorScorer._to_float(top_k_scores_raw[rank], 0.0)
 
                     node_id = ""
                     if top_k_node_ids_raw is not None and rank < len(top_k_node_ids_raw):
@@ -241,145 +207,6 @@ class DeepSeekDeltaScorer:
         return items, inferred_m
 
     @staticmethod
-    def _merge_instruction_and_input(instruction: str, input_text: str) -> str:
-        instruction = (instruction or "").strip()
-        input_text = (input_text or "").strip()
-        if instruction and input_text:
-            return f"{instruction}\n{input_text}"
-        return instruction or input_text
-
-    @staticmethod
-    def _extract_turns(sample: Dict[str, Any]) -> List[Dict[str, str]]:
-        """Support both ShareGPT and train.jsonl-style samples."""
-        if "conversations" in sample and isinstance(sample.get("conversations"), list):
-            conversations = sample.get("conversations", [])
-            turns: List[Dict[str, str]] = []
-
-            for idx in range(len(conversations)):
-                if idx % 2 != 0:
-                    continue
-
-                instruction = conversations[idx].get("value", "")
-                if idx != len(conversations) - 1:
-                    response = conversations[idx + 1].get("value", "")
-                else:
-                    response = ""
-
-                turns.append({"instruction": instruction, "response": response})
-
-            return turns
-
-        merged_instruction = DeepSeekDeltaScorer._merge_instruction_and_input(
-            sample.get("instruction", ""),
-            sample.get("input", ""),
-        )
-        return [{"instruction": merged_instruction, "response": sample.get("output", "")}]
-
-    @staticmethod
-    def _extract_top_logprobs(choice_logprobs: Any) -> Optional[List[Dict[str, float]]]:
-        """Support common OpenAI-compatible logprobs response shapes."""
-        if not choice_logprobs:
-            return None
-
-        content = None
-        if isinstance(choice_logprobs, dict):
-            content = choice_logprobs.get("content")
-        else:
-            content = getattr(choice_logprobs, "content", None)
-
-        if not content:
-            return None
-
-        first_token_info = content[0]
-        if isinstance(first_token_info, dict):
-            top_logprobs = first_token_info.get("top_logprobs")
-        else:
-            top_logprobs = getattr(first_token_info, "top_logprobs", None)
-
-        if not top_logprobs:
-            return None
-
-        normalized: List[Dict[str, float]] = []
-
-        if isinstance(top_logprobs, dict):
-            for token, logprob in top_logprobs.items():
-                if token is None or logprob is None:
-                    continue
-                normalized.append({"token": str(token), "logprob": float(logprob)})
-            return normalized if normalized else None
-
-        for item in top_logprobs:
-            if isinstance(item, dict):
-                token = item.get("token")
-                logprob = item.get("logprob")
-            else:
-                token = getattr(item, "token", None)
-                logprob = getattr(item, "logprob", None)
-
-            if token is None or logprob is None:
-                continue
-
-            normalized.append({"token": str(token), "logprob": float(logprob)})
-
-        return normalized if normalized else None
-
-    @staticmethod
-    def _score_from_top_logprobs(top_logprobs: List[Dict[str, float]]) -> float:
-        """Replicate Scorer.infer_score with token IDs replaced by digit tokens."""
-        digit_to_logprob: Dict[str, Optional[float]] = {
-            "1": None,
-            "2": None,
-            "3": None,
-            "4": None,
-            "5": None,
-            "6": None,
-        }
-
-        for item in top_logprobs:
-            token = item["token"].strip()
-            if token in digit_to_logprob and digit_to_logprob[token] is None:
-                digit_to_logprob[token] = item["logprob"]
-
-        if any(v is None for v in digit_to_logprob.values()):
-            return 3.0
-
-        logits = [digit_to_logprob[str(i)] for i in range(1, 7)]
-        probs = DeepSeekDeltaScorer._softmax(logits)
-        score = float(sum(p * s for p, s in zip(probs, DeepSeekDeltaScorer.score_template)))
-        return score
-
-    @staticmethod
-    def _extract_digit_score(text: str) -> Optional[float]:
-        """Extract a single-digit score from model text output."""
-        if not text:
-            return None
-
-        cleaned = text.strip()
-        if not cleaned:
-            return None
-
-        if cleaned in {"1", "2", "3", "4", "5", "6"}:
-            return float(cleaned)
-
-        match = re.search(r"(?<!\d)([1-6])(?!\d)", cleaned)
-        if match:
-            return float(match.group(1))
-
-        return None
-
-    @staticmethod
-    def _aggregate_turn_scores(scores: List[float], mode: str) -> float:
-        if not scores:
-            return 0.0
-        if mode == "sum":
-            return float(sum(scores))
-        if mode == "mean":
-            return float(sum(scores) / len(scores))
-        if mode == "max":
-            return float(max(scores))
-        raise ValueError(f"Unsupported turn aggregation: {mode}")
-
-    @staticmethod
     def _normalize_weights(weights: List[float], mode: str) -> List[float]:
         if not weights:
             return []
@@ -400,7 +227,7 @@ class DeepSeekDeltaScorer:
         fallback_idx: int,
         routing_map: Dict[str, RoutedItem],
     ) -> Tuple[Any, RoutedItem]:
-        sample_id = DeepSeekDeltaScorer._choose_row_id(sample, fallback_idx)
+        sample_id = DeepSeekAlpagasusVectorScorer._choose_row_id(sample, fallback_idx)
         routed = routing_map.get(str(sample_id))
         if routed is None and str(sample_id) != str(fallback_idx):
             routed = routing_map.get(str(fallback_idx))
@@ -411,17 +238,58 @@ class DeepSeekDeltaScorer:
             )
         return sample_id, routed
 
-    def _call_deepseek(self, user_input: str) -> float:
+    @staticmethod
+    def generate_prompt(row: Dict[str, Any]) -> str:
+        instruction = str(row.get("instruction", ""))
+        input_data = str(row.get("input", ""))
+        output_data = str(row.get("output", row.get("response", "")))
+
+        # Keep the same scoring prompt logic as alpagasus_origin.
+        if input_data != "" or input_data == "Noinput":
+            return (
+                "Following the format <yes/no>||<explanation why yes or no>. "
+                f"Given the following instruction: {instruction} and the following "
+                f"input: {input_data}, is the output '{output_data}' correct?"
+            )
+        return (
+            "Following the format <yes/no>||<explanation why yes or no>. "
+            f"Given the following instruction: {instruction}, "
+            f"is the output '{output_data}' correct?"
+        )
+
+    @staticmethod
+    def parse_judge_response(response_text: str) -> Tuple[bool, float, str]:
+        text = (response_text or "").strip()
+        if not text:
+            return False, 0.0, ""
+
+        if "||" in text:
+            first, second = text.split("||", 1)
+        else:
+            parts = re.split(r"[,\.]", text, maxsplit=1)
+            first = parts[0]
+            second = parts[1] if len(parts) > 1 else ""
+
+        first_lower = first.lower()
+        is_yes = "yes" in first_lower
+        score = 1.0 if is_yes else 0.0
+        return is_yes, score, second.strip()
+
+    def call_deepseek(
+        self,
+        prompt: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> str:
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": user_input}],
-            "max_tokens": 1,
-            "temperature": 0,
-            "logprobs": True,
-            "top_logprobs": 20,
-            "stream": False,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
         }
-
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -445,137 +313,146 @@ class DeepSeekDeltaScorer:
 
                 resp.raise_for_status()
                 data = resp.json()
-
                 choices = data.get("choices", [])
                 if not choices:
-                    logger.warning("Empty choices from DeepSeek, fallback score=3.0")
-                    return 3.0
-
-                message_content = choices[0].get("message", {}).get("content", "")
-                parsed_score = self._extract_digit_score(str(message_content))
-                if parsed_score is not None:
-                    return parsed_score
-
-                top_logprobs = self._extract_top_logprobs(choices[0].get("logprobs"))
-                if not top_logprobs:
-                    logger.warning("Missing logprobs from DeepSeek, fallback score=3.0")
-                    return 3.0
-
-                return self._score_from_top_logprobs(top_logprobs)
+                    return ""
+                return str(choices[0].get("message", {}).get("content", "")).strip()
 
             except (requests.RequestException, ValueError, KeyError) as exc:
                 if attempt == self.max_retries:
-                    logger.warning("DeepSeek request failed after retries, fallback score=3.0: %s", exc)
-                    return 3.0
+                    raise RuntimeError(f"DeepSeek API request failed after retries: {exc}") from exc
+                time.sleep(self.retry_sleep * attempt)
 
-                sleep_seconds = self.retry_backoff ** (attempt - 1)
-                time.sleep(sleep_seconds)
-
-        return 3.0
+        return ""
 
     def _score_one_sample(
         self,
         sample: Dict[str, Any],
+        sample_index: int,
         sample_id: Any,
         routed_item: RoutedItem,
         m_dimensions: int,
-        turn_aggregation: str,
         routing_weight_mode: str,
-        store_turn_scores: bool,
+        dry_run: bool,
+        temperature: float,
+        max_tokens: int,
         attach_routing_meta: bool,
+        include_prompt: bool,
     ) -> Dict[str, Any]:
-        turns = self._extract_turns(sample)
-        delta_scores: List[float] = []
+        prompt = self.generate_prompt(sample)
+        raw_response = "yes||dry run" if dry_run else self.call_deepseek(prompt, temperature, max_tokens)
 
-        for turn in turns:
-            complexity_score = self.infer_complexity(turn["instruction"])
-            quality_score = self.infer_quality(turn["instruction"], turn["response"])
+        judge_pass, judge_score, judge_reason = self.parse_judge_response(raw_response)
+        judge_score = float(judge_score)
 
-            complexity_score = float(complexity_score)
-            quality_score = float(quality_score)
-            delta_score = float(complexity_score * quality_score)
-            delta_scores.append(delta_score)
-
-        delta_scalar = self._aggregate_turn_scores(delta_scores, mode=turn_aggregation)
         mapped_vector = [0.0] * m_dimensions
-
         weights = self._normalize_weights(routed_item.top_k_scores, mode=routing_weight_mode)
-        for idx, weight in zip(routed_item.top_k_indices, weights):
+        for idx, w in zip(routed_item.top_k_indices, weights):
             if 0 <= idx < m_dimensions:
-                mapped_vector[idx] += float(delta_scalar * weight)
+                mapped_vector[idx] += float(judge_score * w)
 
-        sample["id"] = sample_id
-        sample["delta_scalar"] = delta_scalar
-        sample["mapped_vector"] = mapped_vector
-        sample["score"] = mapped_vector
-        sample["score_type"] = "delta_origin_mapped_vector"
-        sample["score_turn_aggregation"] = turn_aggregation
-
-        if store_turn_scores:
-            sample["score_by_turn_scalar"] = delta_scores
+        item = dict(sample)
+        item["id"] = sample_id
+        item["judge_model"] = self.model
+        item["judge_response"] = raw_response
+        item["judge_pass"] = bool(judge_pass)
+        item["judge_score"] = judge_score
+        item["judge_reason"] = judge_reason
+        item["judge_index"] = int(sample_index)
+        item["alpagasus_scalar"] = judge_score
+        item["mapped_vector"] = mapped_vector
+        item["score"] = mapped_vector
+        item["score_type"] = "alpagasus_mapped_vector"
+        item["routing_weight_mode"] = routing_weight_mode
+        if include_prompt:
+            item["judge_prompt"] = prompt
 
         if attach_routing_meta:
-            sample["top_k_indices"] = routed_item.top_k_indices
-            sample["top_k_scores"] = routed_item.top_k_scores
-            sample["top_k_node_ids"] = routed_item.top_k_node_ids
-            sample["top_k_node_names"] = routed_item.top_k_node_names
-            sample["top_k_node_paths"] = routed_item.top_k_node_paths
+            item["top_k_indices"] = routed_item.top_k_indices
+            item["top_k_scores"] = routed_item.top_k_scores
+            item["top_k_node_ids"] = routed_item.top_k_node_ids
+            item["top_k_node_names"] = routed_item.top_k_node_names
+            item["top_k_node_paths"] = routed_item.top_k_node_paths
 
-        return sample
+        return item
 
     def score_dataset(
         self,
         data: List[Dict[str, Any]],
         routing_map: Dict[str, RoutedItem],
         m_dimensions: int,
-        turn_aggregation: str,
+        starting_sample: int,
+        max_samples: int,
+        concurrency: int,
         routing_weight_mode: str,
-        concurrency: int = 1,
-        max_samples: int = -1,
-        store_turn_scores: bool = False,
-        attach_routing_meta: bool = True,
-    ) -> List[Dict[str, Any]]:
-        if max_samples is not None and max_samples >= 0:
-            data = data[:max_samples]
+        dry_run: bool,
+        temperature: float,
+        max_tokens: int,
+        attach_routing_meta: bool,
+        include_prompt: bool,
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
+        total = len(data)
+        start = max(0, int(starting_sample))
+        if start >= total:
+            raise ValueError(f"starting_sample={start} out of range for dataset size {total}.")
+
+        if max_samples is None or int(max_samples) < 0:
+            end = total
+        else:
+            end = min(start + int(max_samples), total)
+
+        selected = data[start:end]
+        logger.info("Loaded %d rows, scoring rows [%d, %d) -> %d", total, start, end, len(selected))
 
         if concurrency < 1:
             raise ValueError("--concurrency must be >= 1")
 
         if concurrency == 1:
-            iterator = tqdm(data, total=len(data), desc="Scoring samples") if tqdm else data
-            for idx, sample in enumerate(iterator):
-                sample_id, routed_item = self._resolve_sample_routing(sample, idx, routing_map)
-                data[idx] = self._score_one_sample(
-                    sample=sample,
-                    sample_id=sample_id,
-                    routed_item=routed_item,
-                    m_dimensions=m_dimensions,
-                    turn_aggregation=turn_aggregation,
-                    routing_weight_mode=routing_weight_mode,
-                    store_turn_scores=store_turn_scores,
-                    attach_routing_meta=attach_routing_meta,
+            iterator = tqdm(selected, total=len(selected), desc="Scoring samples") if tqdm else selected
+            out: List[Dict[str, Any]] = []
+            for local_idx, sample in enumerate(iterator):
+                global_idx = start + local_idx
+                sample_id, routed_item = self._resolve_sample_routing(sample, global_idx, routing_map)
+                out.append(
+                    self._score_one_sample(
+                        sample=sample,
+                        sample_index=global_idx,
+                        sample_id=sample_id,
+                        routed_item=routed_item,
+                        m_dimensions=m_dimensions,
+                        routing_weight_mode=routing_weight_mode,
+                        dry_run=dry_run,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        attach_routing_meta=attach_routing_meta,
+                        include_prompt=include_prompt,
+                    )
                 )
-            return data
+            return out, start, end
 
-        results: List[Optional[Dict[str, Any]]] = [None] * len(data)
+        results: List[Optional[Dict[str, Any]]] = [None] * len(selected)
 
-        def worker(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
-            sample_id, routed_item = self._resolve_sample_routing(row, index, routing_map)
+        def worker(local_idx: int, row: Dict[str, Any]) -> Dict[str, Any]:
+            global_idx = start + local_idx
+            sample_id, routed_item = self._resolve_sample_routing(row, global_idx, routing_map)
             return self._score_one_sample(
                 sample=row,
+                sample_index=global_idx,
                 sample_id=sample_id,
                 routed_item=routed_item,
                 m_dimensions=m_dimensions,
-                turn_aggregation=turn_aggregation,
                 routing_weight_mode=routing_weight_mode,
-                store_turn_scores=store_turn_scores,
+                dry_run=dry_run,
+                temperature=temperature,
+                max_tokens=max_tokens,
                 attach_routing_meta=attach_routing_meta,
+                include_prompt=include_prompt,
             )
 
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = {
                 executor.submit(worker, idx, sample): idx
-                for idx, sample in enumerate(data)
+                for idx, sample in enumerate(selected)
             }
 
             progress = tqdm(total=len(futures), desc="Scoring samples") if tqdm else None
@@ -589,19 +466,15 @@ class DeepSeekDeltaScorer:
                 if progress:
                     progress.close()
 
-        return [item for item in results if item is not None]
-
-    def infer_complexity(self, input_text: str) -> float:
-        user_input = self.complexity_template.format(instruction=input_text)
-        return self._call_deepseek(user_input)
-
-    def infer_quality(self, input_text: str, resp_text: str) -> float:
-        user_input = self.quality_template.format(instruction=input_text, output=resp_text)
-        return self._call_deepseek(user_input)
+        return [x for x in results if x is not None], start, end
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compute DEITA delta scores with DeepSeek API.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Score Alpaca-style data with DeepSeek API and map scalar score into capability-dimension vectors."
+        )
+    )
     parser.add_argument("--data_path", type=str, required=True, help="Input dataset path (JSON or JSONL).")
     parser.add_argument(
         "--routing_path",
@@ -623,13 +496,6 @@ def parse_args() -> argparse.Namespace:
         help="Use at most top-k routed clusters for mapping; <=0 means all.",
     )
     parser.add_argument(
-        "--turn_aggregation",
-        type=str,
-        choices=["sum", "mean", "max"],
-        default="sum",
-        help="How to aggregate multi-turn scalar delta into one sample-level scalar.",
-    )
-    parser.add_argument(
         "--routing_weight_mode",
         type=str,
         choices=["coarse", "uniform"],
@@ -639,19 +505,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--api_key",
         type=str,
-        default=os.getenv("DEEPSEEK_API_KEY"),
-        help="DeepSeek API key. Defaults to env DEEPSEEK_API_KEY.",
+        default=os.getenv("DEEPSEEK_API_KEY", ""),
+        help="DeepSeek API key. Defaults to DEEPSEEK_API_KEY.",
     )
     parser.add_argument("--model", type=str, default="deepseek-chat", help="DeepSeek model name.")
-    parser.add_argument(
-        "--base_url",
-        type=str,
-        default="https://api.deepseek.com",
-        help="DeepSeek base url, e.g. https://api.deepseek.com",
-    )
-    parser.add_argument("--request_timeout", type=int, default=60, help="HTTP request timeout in seconds.")
-    parser.add_argument("--max_retries", type=int, default=5, help="Retry attempts per request.")
-    parser.add_argument("--retry_backoff", type=float, default=1.5, help="Exponential retry backoff base.")
+    parser.add_argument("--base_url", type=str, default="https://api.deepseek.com", help="DeepSeek base URL.")
+    parser.add_argument("--temperature", type=float, default=0.01, help="Sampling temperature.")
+    parser.add_argument("--max_tokens", type=int, default=200)
+    parser.add_argument("--max_samples", type=int, default=-1, help="Number of samples to process; -1 means all.")
+    parser.add_argument("--starting_sample", type=int, default=0, help="Start index in dataset.")
+    parser.add_argument("--max_retries", type=int, default=3, help="Retry attempts per API call.")
+    parser.add_argument("--timeout", type=int, default=120, help="HTTP timeout in seconds.")
+    parser.add_argument("--retry_sleep", type=float, default=2.0, help="Base sleep seconds between retries.")
     parser.add_argument(
         "--concurrency",
         "--concurrancy",
@@ -660,37 +525,34 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="Number of concurrent worker threads.",
     )
-    parser.add_argument(
-        "--max_samples",
-        type=int,
-        default=-1,
-        help="Only score first N samples. Use -1 to score all samples.",
-    )
-    parser.add_argument(
-        "--store_turn_scores",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Whether to store score_by_turn_scalar (larger output).",
-    )
+    parser.add_argument("--dry_run", action="store_true", dest="dry_run")
     parser.add_argument(
         "--attach_routing_meta",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Whether to store routed top-k metadata alongside scores.",
     )
+    parser.add_argument(
+        "--include_prompt",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Whether to include the full judge prompt in outputs.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if not args.dry_run and not args.api_key:
+        raise ValueError("Missing API key. Use --api_key or set DEEPSEEK_API_KEY.")
 
-    scorer = DeepSeekDeltaScorer(
+    scorer = DeepSeekAlpagasusVectorScorer(
         api_key=args.api_key,
         model=args.model,
         base_url=args.base_url,
-        request_timeout=args.request_timeout,
+        request_timeout=args.timeout,
         max_retries=args.max_retries,
-        retry_backoff=args.retry_backoff,
+        retry_sleep=args.retry_sleep,
     )
 
     data, input_format = scorer._load_json_or_jsonl(args.data_path)
@@ -717,21 +579,22 @@ def main() -> None:
     logger.info("Loaded %d samples from %s", len(data), args.data_path)
     logger.info("Loaded %d routed rows from %s", len(routing_map), args.routing_path)
     if args.max_samples >= 0:
-        logger.info("Scoring first %d samples (--max_samples).", min(args.max_samples, len(data)))
-    logger.info("Using concurrency=%d", args.concurrency)
-    logger.info("Turn aggregation=%s", args.turn_aggregation)
+        logger.info("Scoring first %d samples (--max_samples)", min(args.max_samples, len(data)))
     logger.info("Routing weight mode=%s", args.routing_weight_mode)
 
-    scored_data = scorer.score_dataset(
-        data,
+    scored_data, start, end = scorer.score_dataset(
+        data=data,
         routing_map=routing_map,
         m_dimensions=m_dimensions,
-        turn_aggregation=args.turn_aggregation,
-        routing_weight_mode=args.routing_weight_mode,
-        concurrency=args.concurrency,
+        starting_sample=args.starting_sample,
         max_samples=args.max_samples,
-        store_turn_scores=bool(args.store_turn_scores),
+        concurrency=args.concurrency,
+        routing_weight_mode=args.routing_weight_mode,
+        dry_run=bool(args.dry_run),
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
         attach_routing_meta=bool(args.attach_routing_meta),
+        include_prompt=bool(args.include_prompt),
     )
 
     output_dir = os.path.dirname(args.output_path)
@@ -746,7 +609,7 @@ def main() -> None:
         else:
             json.dump(scored_data, f, ensure_ascii=False, indent=2)
 
-    logger.info("Saved scored dataset to %s", args.output_path)
+    logger.info("Saved scored rows [%d, %d) to %s", start, end, args.output_path)
 
 
 if __name__ == "__main__":

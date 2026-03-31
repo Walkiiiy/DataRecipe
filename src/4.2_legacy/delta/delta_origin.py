@@ -1,6 +1,5 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 import json
 import logging
 import math
@@ -11,33 +10,20 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-
 try:
     from tqdm import tqdm
 except ImportError:
     tqdm = None
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class RoutedItem:
-    row_index: int
-    sample_id: Any
-    top_k_indices: List[int]
-    top_k_scores: List[float]
-    top_k_node_ids: List[str]
-    top_k_node_names: List[str]
-    top_k_node_paths: List[str]
 
 
 class DeepSeekDeltaScorer:
     """DEITA delta scorer with DeepSeek API backend.
 
-    Origin scalar delta is preserved as `delta_scalar`, and then mapped into an
-    m-dim capability vector using routed top-k indices.
+    Adapted for OpenAI-compatible APIs by requesting strict numeric outputs (1-6)
+    and parsing them directly. Falls back to logprob-based expectation when needed.
     """
 
     complexity_template = (
@@ -107,27 +93,6 @@ class DeepSeekDeltaScorer:
         return [v / exp_sum for v in exp_logits]
 
     @staticmethod
-    def _to_int(value: Any, default: int) -> int:
-        try:
-            return int(value)
-        except Exception:  # noqa: BLE001
-            return default
-
-    @staticmethod
-    def _to_float(value: Any, default: float) -> float:
-        try:
-            return float(value)
-        except Exception:  # noqa: BLE001
-            return default
-
-    @staticmethod
-    def _choose_row_id(row: Dict[str, Any], fallback_idx: int) -> Any:
-        for key in ("id", "data_id", "uid", "idx", "index"):
-            if key in row and row[key] is not None:
-                return row[key]
-        return fallback_idx
-
-    @staticmethod
     def _load_json_or_jsonl(path: str) -> Tuple[List[Dict[str, Any]], str]:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read().strip()
@@ -143,102 +108,6 @@ class DeepSeekDeltaScorer:
         except json.JSONDecodeError:
             lines = [line for line in text.splitlines() if line.strip()]
             return [json.loads(line) for line in lines], "jsonl"
-
-    @staticmethod
-    def _extract_optional_list(row: Dict[str, Any], key: str) -> Optional[List[Any]]:
-        value = row.get(key)
-        if value is None:
-            return None
-        if not isinstance(value, list):
-            return None
-        return value
-
-    @staticmethod
-    def _load_routing_jsonl(
-        routing_path: str,
-        max_top_k: int,
-    ) -> Tuple[Dict[str, RoutedItem], int]:
-        items: Dict[str, RoutedItem] = {}
-        inferred_m = 0
-
-        with open(routing_path, "r", encoding="utf-8") as f:
-            for row_index, line in enumerate(f):
-                raw = line.strip()
-                if not raw:
-                    continue
-                row = json.loads(raw)
-
-                sample_id = row.get("id", row_index)
-                top_k_indices_raw = row.get("top_k_indices")
-                top_k_scores_raw = row.get("top_k_scores")
-                if not isinstance(top_k_indices_raw, list) or not isinstance(top_k_scores_raw, list):
-                    raise ValueError(
-                        f"Invalid routing row at line={row_index + 1}: missing list top_k_indices/top_k_scores"
-                    )
-                if len(top_k_indices_raw) != len(top_k_scores_raw):
-                    raise ValueError(
-                        f"Routing row length mismatch at line={row_index + 1}: "
-                        f"top_k_indices={len(top_k_indices_raw)} vs top_k_scores={len(top_k_scores_raw)}"
-                    )
-
-                limit = len(top_k_indices_raw)
-                if max_top_k > 0:
-                    limit = min(limit, max_top_k)
-
-                top_k_node_ids_raw = DeepSeekDeltaScorer._extract_optional_list(row, "top_k_node_ids")
-                top_k_node_names_raw = DeepSeekDeltaScorer._extract_optional_list(row, "top_k_node_names")
-                top_k_node_paths_raw = DeepSeekDeltaScorer._extract_optional_list(row, "top_k_node_paths")
-
-                top_k_indices: List[int] = []
-                top_k_scores: List[float] = []
-                top_k_node_ids: List[str] = []
-                top_k_node_names: List[str] = []
-                top_k_node_paths: List[str] = []
-
-                for rank in range(limit):
-                    idx = DeepSeekDeltaScorer._to_int(top_k_indices_raw[rank], -1)
-                    if idx < 0:
-                        continue
-                    score = DeepSeekDeltaScorer._to_float(top_k_scores_raw[rank], 0.0)
-
-                    node_id = ""
-                    if top_k_node_ids_raw is not None and rank < len(top_k_node_ids_raw):
-                        node_id = str(top_k_node_ids_raw[rank] or "").strip()
-
-                    node_name = ""
-                    if top_k_node_names_raw is not None and rank < len(top_k_node_names_raw):
-                        node_name = str(top_k_node_names_raw[rank] or "").strip()
-
-                    node_path = ""
-                    if top_k_node_paths_raw is not None and rank < len(top_k_node_paths_raw):
-                        node_path = str(top_k_node_paths_raw[rank] or "").strip()
-
-                    top_k_indices.append(idx)
-                    top_k_scores.append(score)
-                    top_k_node_ids.append(node_id)
-                    top_k_node_names.append(node_name)
-                    top_k_node_paths.append(node_path)
-                    inferred_m = max(inferred_m, idx + 1)
-
-                if not top_k_indices:
-                    logger.warning("Routing row id=%s has no valid candidates and will be ignored.", sample_id)
-                    continue
-
-                key = str(sample_id)
-                if key in items:
-                    logger.warning("Duplicate routing id=%s found; keeping the last row.", key)
-
-                items[key] = RoutedItem(
-                    row_index=row_index,
-                    sample_id=sample_id,
-                    top_k_indices=top_k_indices,
-                    top_k_scores=top_k_scores,
-                    top_k_node_ids=top_k_node_ids,
-                    top_k_node_names=top_k_node_names,
-                    top_k_node_paths=top_k_node_paths,
-                )
-
-        return items, inferred_m
 
     @staticmethod
     def _merge_instruction_and_input(instruction: str, input_text: str) -> str:
@@ -301,6 +170,7 @@ class DeepSeekDeltaScorer:
 
         normalized: List[Dict[str, float]] = []
 
+        # Some providers may return dict[token] = logprob instead of list entries.
         if isinstance(top_logprobs, dict):
             for token, logprob in top_logprobs.items():
                 if token is None or logprob is None:
@@ -340,6 +210,7 @@ class DeepSeekDeltaScorer:
             if token in digit_to_logprob and digit_to_logprob[token] is None:
                 digit_to_logprob[token] = item["logprob"]
 
+        # Keep DEITA scorer fallback behavior when target token not available.
         if any(v is None for v in digit_to_logprob.values()):
             return 3.0
 
@@ -358,58 +229,16 @@ class DeepSeekDeltaScorer:
         if not cleaned:
             return None
 
+        # Fast path: exact one-digit output.
         if cleaned in {"1", "2", "3", "4", "5", "6"}:
             return float(cleaned)
 
+        # Allow wrappers like "**4**" or "Score: 4".
         match = re.search(r"(?<!\d)([1-6])(?!\d)", cleaned)
         if match:
             return float(match.group(1))
 
         return None
-
-    @staticmethod
-    def _aggregate_turn_scores(scores: List[float], mode: str) -> float:
-        if not scores:
-            return 0.0
-        if mode == "sum":
-            return float(sum(scores))
-        if mode == "mean":
-            return float(sum(scores) / len(scores))
-        if mode == "max":
-            return float(max(scores))
-        raise ValueError(f"Unsupported turn aggregation: {mode}")
-
-    @staticmethod
-    def _normalize_weights(weights: List[float], mode: str) -> List[float]:
-        if not weights:
-            return []
-        if mode == "uniform":
-            w = 1.0 / len(weights)
-            return [w for _ in weights]
-
-        clipped = [max(0.0, float(x)) for x in weights]
-        total = float(sum(clipped))
-        if total <= 0:
-            w = 1.0 / len(weights)
-            return [w for _ in weights]
-        return [x / total for x in clipped]
-
-    @staticmethod
-    def _resolve_sample_routing(
-        sample: Dict[str, Any],
-        fallback_idx: int,
-        routing_map: Dict[str, RoutedItem],
-    ) -> Tuple[Any, RoutedItem]:
-        sample_id = DeepSeekDeltaScorer._choose_row_id(sample, fallback_idx)
-        routed = routing_map.get(str(sample_id))
-        if routed is None and str(sample_id) != str(fallback_idx):
-            routed = routing_map.get(str(fallback_idx))
-        if routed is None:
-            raise ValueError(
-                f"Missing routing row for sample id={sample_id} (fallback_idx={fallback_idx}). "
-                "Check --routing_path alignment with --data_path."
-            )
-        return sample_id, routed
 
     def _call_deepseek(self, user_input: str) -> float:
         payload = {
@@ -431,12 +260,13 @@ class DeepSeekDeltaScorer:
             try:
                 session = self._get_session()
                 resp = session.post(
+                    # Each worker thread uses its own session.
                     self.endpoint,
                     headers=headers,
                     json=payload,
                     timeout=self.request_timeout,
                 )
-
+                
                 if resp.status_code >= 500 or resp.status_code == 429:
                     raise requests.HTTPError(
                         f"DeepSeek temporary error {resp.status_code}: {resp.text}",
@@ -473,17 +303,7 @@ class DeepSeekDeltaScorer:
 
         return 3.0
 
-    def _score_one_sample(
-        self,
-        sample: Dict[str, Any],
-        sample_id: Any,
-        routed_item: RoutedItem,
-        m_dimensions: int,
-        turn_aggregation: str,
-        routing_weight_mode: str,
-        store_turn_scores: bool,
-        attach_routing_meta: bool,
-    ) -> Dict[str, Any]:
+    def _score_one_sample(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         turns = self._extract_turns(sample)
         delta_scores: List[float] = []
 
@@ -496,85 +316,36 @@ class DeepSeekDeltaScorer:
             delta_score = float(complexity_score * quality_score)
             delta_scores.append(delta_score)
 
-        delta_scalar = self._aggregate_turn_scores(delta_scores, mode=turn_aggregation)
-        mapped_vector = [0.0] * m_dimensions
-
-        weights = self._normalize_weights(routed_item.top_k_scores, mode=routing_weight_mode)
-        for idx, weight in zip(routed_item.top_k_indices, weights):
-            if 0 <= idx < m_dimensions:
-                mapped_vector[idx] += float(delta_scalar * weight)
-
-        sample["id"] = sample_id
-        sample["delta_scalar"] = delta_scalar
-        sample["mapped_vector"] = mapped_vector
-        sample["score"] = mapped_vector
-        sample["score_type"] = "delta_origin_mapped_vector"
-        sample["score_turn_aggregation"] = turn_aggregation
-
-        if store_turn_scores:
-            sample["score_by_turn_scalar"] = delta_scores
-
-        if attach_routing_meta:
-            sample["top_k_indices"] = routed_item.top_k_indices
-            sample["top_k_scores"] = routed_item.top_k_scores
-            sample["top_k_node_ids"] = routed_item.top_k_node_ids
-            sample["top_k_node_names"] = routed_item.top_k_node_names
-            sample["top_k_node_paths"] = routed_item.top_k_node_paths
-
+        sample["score"] = delta_scores
         return sample
 
     def score_dataset(
         self,
         data: List[Dict[str, Any]],
-        routing_map: Dict[str, RoutedItem],
-        m_dimensions: int,
-        turn_aggregation: str,
-        routing_weight_mode: str,
         concurrency: int = 1,
         max_samples: int = -1,
-        store_turn_scores: bool = False,
-        attach_routing_meta: bool = True,
     ) -> List[Dict[str, Any]]:
+        """Compute DEITA delta score per sample.
+
+        delta_score = sum_i (complexity_scores[i] * quality_scores[i])
+        """
         if max_samples is not None and max_samples >= 0:
             data = data[:max_samples]
 
         if concurrency < 1:
             raise ValueError("--concurrency must be >= 1")
 
+        # Keep the simple single-thread path for deterministic debugging.
         if concurrency == 1:
             iterator = tqdm(data, total=len(data), desc="Scoring samples") if tqdm else data
             for idx, sample in enumerate(iterator):
-                sample_id, routed_item = self._resolve_sample_routing(sample, idx, routing_map)
-                data[idx] = self._score_one_sample(
-                    sample=sample,
-                    sample_id=sample_id,
-                    routed_item=routed_item,
-                    m_dimensions=m_dimensions,
-                    turn_aggregation=turn_aggregation,
-                    routing_weight_mode=routing_weight_mode,
-                    store_turn_scores=store_turn_scores,
-                    attach_routing_meta=attach_routing_meta,
-                )
+                data[idx] = self._score_one_sample(sample)
             return data
 
         results: List[Optional[Dict[str, Any]]] = [None] * len(data)
-
-        def worker(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
-            sample_id, routed_item = self._resolve_sample_routing(row, index, routing_map)
-            return self._score_one_sample(
-                sample=row,
-                sample_id=sample_id,
-                routed_item=routed_item,
-                m_dimensions=m_dimensions,
-                turn_aggregation=turn_aggregation,
-                routing_weight_mode=routing_weight_mode,
-                store_turn_scores=store_turn_scores,
-                attach_routing_meta=attach_routing_meta,
-            )
-
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = {
-                executor.submit(worker, idx, sample): idx
+                executor.submit(self._score_one_sample, sample): idx
                 for idx, sample in enumerate(data)
             }
 
@@ -603,39 +374,7 @@ class DeepSeekDeltaScorer:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compute DEITA delta scores with DeepSeek API.")
     parser.add_argument("--data_path", type=str, required=True, help="Input dataset path (JSON or JSONL).")
-    parser.add_argument(
-        "--routing_path",
-        type=str,
-        required=True,
-        help="Coarse routing jsonl path (e.g. train_coarse_topk5.jsonl).",
-    )
     parser.add_argument("--output_path", type=str, required=True, help="Output path for scored JSON or JSONL.")
-    parser.add_argument(
-        "--m_dimensions",
-        type=int,
-        default=None,
-        help="Capability dimension m. If omitted, infer from routing top_k_indices.",
-    )
-    parser.add_argument(
-        "--max_top_k",
-        type=int,
-        default=5,
-        help="Use at most top-k routed clusters for mapping; <=0 means all.",
-    )
-    parser.add_argument(
-        "--turn_aggregation",
-        type=str,
-        choices=["sum", "mean", "max"],
-        default="sum",
-        help="How to aggregate multi-turn scalar delta into one sample-level scalar.",
-    )
-    parser.add_argument(
-        "--routing_weight_mode",
-        type=str,
-        choices=["coarse", "uniform"],
-        default="coarse",
-        help="coarse: use normalized top_k_scores as weights; uniform: equal weights.",
-    )
     parser.add_argument(
         "--api_key",
         type=str,
@@ -666,18 +405,6 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Only score first N samples. Use -1 to score all samples.",
     )
-    parser.add_argument(
-        "--store_turn_scores",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Whether to store score_by_turn_scalar (larger output).",
-    )
-    parser.add_argument(
-        "--attach_routing_meta",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to store routed top-k metadata alongside scores.",
-    )
     return parser.parse_args()
 
 
@@ -694,44 +421,15 @@ def main() -> None:
     )
 
     data, input_format = scorer._load_json_or_jsonl(args.data_path)
-    routing_map, inferred_m = scorer._load_routing_jsonl(
-        routing_path=args.routing_path,
-        max_top_k=int(args.max_top_k),
-    )
-
-    if not routing_map:
-        raise ValueError("No valid routed rows loaded. Check --routing_path.")
-
-    if args.m_dimensions is None:
-        m_dimensions = int(inferred_m)
-        logger.info("m_dimensions inferred from routing indices: %d", m_dimensions)
-    else:
-        if args.m_dimensions <= 0:
-            raise ValueError("--m_dimensions must be > 0")
-        m_dimensions = int(args.m_dimensions)
-        if m_dimensions < inferred_m:
-            raise ValueError(
-                f"--m_dimensions={m_dimensions} is too small; routing requires >= {inferred_m}."
-            )
-
     logger.info("Loaded %d samples from %s", len(data), args.data_path)
-    logger.info("Loaded %d routed rows from %s", len(routing_map), args.routing_path)
     if args.max_samples >= 0:
         logger.info("Scoring first %d samples (--max_samples).", min(args.max_samples, len(data)))
     logger.info("Using concurrency=%d", args.concurrency)
-    logger.info("Turn aggregation=%s", args.turn_aggregation)
-    logger.info("Routing weight mode=%s", args.routing_weight_mode)
 
     scored_data = scorer.score_dataset(
         data,
-        routing_map=routing_map,
-        m_dimensions=m_dimensions,
-        turn_aggregation=args.turn_aggregation,
-        routing_weight_mode=args.routing_weight_mode,
         concurrency=args.concurrency,
         max_samples=args.max_samples,
-        store_turn_scores=bool(args.store_turn_scores),
-        attach_routing_meta=bool(args.attach_routing_meta),
     )
 
     output_dir = os.path.dirname(args.output_path)

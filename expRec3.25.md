@@ -105,7 +105,7 @@ $Z = \sum_{j \in \mathcal{K}^*} \exp(S_j / \tau)$ $S_{emb}^{(k)} = \exp(S_k / \t
 
 python3 src/4.2/stage_1_capability_extraction.py \
   --tree-json data/banking77/capability_tree_final_pruned.json \
-  --profile-jsonl data/banking77/banking77_cdt_profile.jsonl \
+  --profile-jsonl data/banking77/cdt_profile.jsonl \
   --api-key "sk-ab412f420cd540888da4732a35600c4a" \
   --model deepseek-chat \
   --base-url https://api.deepseek.com \

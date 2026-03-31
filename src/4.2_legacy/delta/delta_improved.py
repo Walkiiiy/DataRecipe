@@ -17,38 +17,26 @@ try:
 except ImportError:
     tqdm = None
 
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class RoutedCandidate:
-    index: int
-    coarse_score: float
+@dataclass
+class CapabilityCluster:
+    order: int
     node_id: str
-    node_name: str
-    node_path: str
-
-
-@dataclass(frozen=True)
-class RoutedItem:
-    row_index: int
-    sample_id: Any
-    top_k_indices: List[int]
-    top_k_scores: List[float]
-    top_k_node_ids: List[str]
-    top_k_node_names: List[str]
-    top_k_node_paths: List[str]
-    candidates: List[RoutedCandidate]
+    capability_name: str
+    capability_name_zh: str
+    capability_definition: str
+    cluster_size: int
 
 
 class DeepSeekDeltaArrayScorer:
-    """Top-k routed DEITA delta scorer with DeepSeek API backend.
+    """Cluster-conditional DEITA delta scorer with DeepSeek API backend.
 
     For each turn:
-      delta_k = complexity(turn) * quality(turn, routed_cluster_k)
-    Then aggregate over turns and map scores into an m-dim dense vector.
+      delta_k = complexity(turn) * quality(turn, cluster_k)
+    Then aggregate over turns (sum/mean/max) to get one score array per sample.
     """
 
     complexity_template = (
@@ -62,16 +50,14 @@ class DeepSeekDeltaArrayScorer:
 
     quality_cluster_template = (
         "You are a strict grader.\n"
-        "Given one candidate capability cluster from a capability tree, evaluate how well the response fits "
-        "this capability for the given question on a 1-6 scale.\n"
+        "Given a target capability cluster, evaluate how well the response fits this capability "
+        "for the given question on a 1-6 scale.\n"
         "Return ONLY one digit: 1, 2, 3, 4, 5, or 6.\n"
         "No words, no explanation, no markdown, no punctuation.\n"
-        "#CapabilityClusterName#:\n"
+        "#CapabilityName#:\n"
         "{capability_name}\n"
-        "#CapabilityNodeId#:\n"
-        "{capability_node_id}\n"
-        "#CapabilityPath#:\n"
-        "{capability_path}\n"
+        "#CapabilityDefinition#:\n"
+        "{capability_definition}\n"
         "#Question#:\n"
         "{instruction}\n"
         "#Response#:\n"
@@ -92,7 +78,7 @@ class DeepSeekDeltaArrayScorer:
         "{instruction}\n"
         "#Response#:\n"
         "{output}\n"
-        "#CandidateClusters#:\n"
+        "#Clusters#:\n"
         "{cluster_block}\n"
         "##JSON:"
     )
@@ -150,20 +136,6 @@ class DeepSeekDeltaArrayScorer:
             return default
 
     @staticmethod
-    def _to_float(value: Any, default: float) -> float:
-        try:
-            return float(value)
-        except Exception:  # noqa: BLE001
-            return default
-
-    @staticmethod
-    def _choose_row_id(row: Dict[str, Any], fallback_idx: int) -> Any:
-        for key in ("id", "data_id", "uid", "idx", "index"):
-            if key in row and row[key] is not None:
-                return row[key]
-        return fallback_idx
-
-    @staticmethod
     def _load_json_or_jsonl(path: str) -> Tuple[List[Dict[str, Any]], str]:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read().strip()
@@ -181,112 +153,52 @@ class DeepSeekDeltaArrayScorer:
             return [json.loads(line) for line in lines], "jsonl"
 
     @staticmethod
-    def _extract_optional_list(row: Dict[str, Any], key: str) -> Optional[List[Any]]:
-        value = row.get(key)
-        if value is None:
-            return None
-        if not isinstance(value, list):
-            return None
-        return value
-
-    @staticmethod
-    def _load_routing_jsonl(
-        routing_path: str,
-        max_top_k: int,
-    ) -> Tuple[Dict[str, RoutedItem], int]:
-        items: Dict[str, RoutedItem] = {}
-        inferred_m = 0
-
-        with open(routing_path, "r", encoding="utf-8") as f:
-            for row_index, line in enumerate(f):
+    def _load_clusters_jsonl(
+        cluster_path: str,
+        cluster_id_field: str,
+        cluster_order_field: str,
+        cluster_name_field: str,
+        cluster_name_zh_field: str,
+        cluster_definition_field: str,
+        min_cluster_size: int,
+        max_clusters: int,
+    ) -> List[CapabilityCluster]:
+        clusters: List[CapabilityCluster] = []
+        with open(cluster_path, "r", encoding="utf-8") as f:
+            for idx, line in enumerate(f):
                 raw = line.strip()
                 if not raw:
                     continue
                 row = json.loads(raw)
 
-                sample_id = row.get("id", row_index)
-                top_k_indices_raw = row.get("top_k_indices")
-                top_k_scores_raw = row.get("top_k_scores")
-                if not isinstance(top_k_indices_raw, list) or not isinstance(top_k_scores_raw, list):
-                    raise ValueError(
-                        f"Invalid routing row at line={row_index + 1}: missing list top_k_indices/top_k_scores"
-                    )
-                if len(top_k_indices_raw) != len(top_k_scores_raw):
-                    raise ValueError(
-                        f"Routing row length mismatch at line={row_index + 1}: "
-                        f"top_k_indices={len(top_k_indices_raw)} vs top_k_scores={len(top_k_scores_raw)}"
-                    )
-
-                limit = len(top_k_indices_raw)
-                if max_top_k > 0:
-                    limit = min(limit, max_top_k)
-
-                top_k_node_ids_raw = DeepSeekDeltaArrayScorer._extract_optional_list(row, "top_k_node_ids")
-                top_k_node_names_raw = DeepSeekDeltaArrayScorer._extract_optional_list(row, "top_k_node_names")
-                top_k_node_paths_raw = DeepSeekDeltaArrayScorer._extract_optional_list(row, "top_k_node_paths")
-
-                candidates: List[RoutedCandidate] = []
-                top_k_indices: List[int] = []
-                top_k_scores: List[float] = []
-                top_k_node_ids: List[str] = []
-                top_k_node_names: List[str] = []
-                top_k_node_paths: List[str] = []
-
-                for rank in range(limit):
-                    idx = DeepSeekDeltaArrayScorer._to_int(top_k_indices_raw[rank], -1)
-                    if idx < 0:
-                        continue
-                    score = DeepSeekDeltaArrayScorer._to_float(top_k_scores_raw[rank], 0.0)
-
-                    node_id = ""
-                    if top_k_node_ids_raw is not None and rank < len(top_k_node_ids_raw):
-                        node_id = str(top_k_node_ids_raw[rank] or "").strip()
-
-                    node_name = ""
-                    if top_k_node_names_raw is not None and rank < len(top_k_node_names_raw):
-                        node_name = str(top_k_node_names_raw[rank] or "").strip()
-                    if not node_name:
-                        node_name = node_id or f"cluster_{idx}"
-
-                    node_path = ""
-                    if top_k_node_paths_raw is not None and rank < len(top_k_node_paths_raw):
-                        node_path = str(top_k_node_paths_raw[rank] or "").strip()
-
-                    candidate = RoutedCandidate(
-                        index=idx,
-                        coarse_score=score,
-                        node_id=node_id,
-                        node_name=node_name,
-                        node_path=node_path,
-                    )
-                    candidates.append(candidate)
-                    top_k_indices.append(idx)
-                    top_k_scores.append(score)
-                    top_k_node_ids.append(node_id)
-                    top_k_node_names.append(node_name)
-                    top_k_node_paths.append(node_path)
-                    inferred_m = max(inferred_m, idx + 1)
-
-                if not candidates:
-                    logger.warning("Routing row id=%s has no valid candidates and will be ignored.", sample_id)
+                cluster_size = DeepSeekDeltaArrayScorer._to_int(
+                    row.get("cluster_size_tree", row.get("subtree_size", 0)),
+                    0,
+                )
+                if cluster_size < min_cluster_size:
                     continue
 
-                key = str(sample_id)
-                if key in items:
-                    logger.warning("Duplicate routing id=%s found; keeping the last row.", key)
+                node_id = str(row.get(cluster_id_field, f"C{idx}"))
+                order = DeepSeekDeltaArrayScorer._to_int(row.get(cluster_order_field, idx), idx)
+                capability_name = str(row.get(cluster_name_field, "")).strip() or f"Cluster {node_id}"
+                capability_name_zh = str(row.get(cluster_name_zh_field, "")).strip()
+                capability_definition = str(row.get(cluster_definition_field, "")).strip()
 
-                items[key] = RoutedItem(
-                    row_index=row_index,
-                    sample_id=sample_id,
-                    top_k_indices=top_k_indices,
-                    top_k_scores=top_k_scores,
-                    top_k_node_ids=top_k_node_ids,
-                    top_k_node_names=top_k_node_names,
-                    top_k_node_paths=top_k_node_paths,
-                    candidates=candidates,
+                clusters.append(
+                    CapabilityCluster(
+                        order=order,
+                        node_id=node_id,
+                        capability_name=capability_name,
+                        capability_name_zh=capability_name_zh,
+                        capability_definition=capability_definition,
+                        cluster_size=cluster_size,
+                    )
                 )
 
-        return items, inferred_m
+        clusters.sort(key=lambda c: c.order)
+        if max_clusters >= 0:
+            clusters = clusters[:max_clusters]
+        return clusters
 
     @staticmethod
     def _merge_instruction_and_input(instruction: str, input_text: str) -> str:
@@ -459,23 +371,6 @@ class DeepSeekDeltaArrayScorer:
             out.extend([3.0] * (expected_len - len(out)))
         return out[:expected_len]
 
-    @staticmethod
-    def _resolve_sample_routing(
-        sample: Dict[str, Any],
-        fallback_idx: int,
-        routing_map: Dict[str, RoutedItem],
-    ) -> Tuple[Any, RoutedItem]:
-        sample_id = DeepSeekDeltaArrayScorer._choose_row_id(sample, fallback_idx)
-        routed = routing_map.get(str(sample_id))
-        if routed is None and str(sample_id) != str(fallback_idx):
-            routed = routing_map.get(str(fallback_idx))
-        if routed is None:
-            raise ValueError(
-                f"Missing routing row for sample id={sample_id} (fallback_idx={fallback_idx}). "
-                "Check --routing_path alignment with --data_path."
-            )
-        return sample_id, routed
-
     def _call_deepseek(self, user_input: str) -> float:
         payload = {
             "model": self.model,
@@ -592,33 +487,38 @@ class DeepSeekDeltaArrayScorer:
         user_input = self.complexity_template.format(instruction=input_text)
         return self._call_deepseek(user_input)
 
-    def infer_quality_for_candidate(self, input_text: str, resp_text: str, candidate: RoutedCandidate) -> float:
+    def infer_quality_for_cluster(self, input_text: str, resp_text: str, cluster: CapabilityCluster) -> float:
+        cap_name = cluster.capability_name
+        if cluster.capability_name_zh:
+            cap_name = f"{cluster.capability_name} / {cluster.capability_name_zh}"
+        cap_def = cluster.capability_definition or "N/A"
         user_input = self.quality_cluster_template.format(
-            capability_name=candidate.node_name or (candidate.node_id or f"cluster_{candidate.index}"),
-            capability_node_id=candidate.node_id or "N/A",
-            capability_path=candidate.node_path or "N/A",
+            capability_name=cap_name,
+            capability_definition=cap_def,
             instruction=input_text,
             output=resp_text,
         )
         return self._call_deepseek(user_input)
 
-    def infer_quality_for_candidate_batch(
+    def infer_quality_for_cluster_batch(
         self,
         input_text: str,
         resp_text: str,
-        candidates: List[RoutedCandidate],
-        cluster_path_max_chars: int = 180,
+        clusters: List[CapabilityCluster],
+        cluster_definition_max_chars: int = 120,
         quality_max_tokens: int = 512,
     ) -> List[float]:
-        if not candidates:
+        if not clusters:
             return []
 
         lines: List[str] = []
-        for i, candidate in enumerate(candidates, start=1):
-            path = self._clip_text(candidate.node_path or "N/A", cluster_path_max_chars)
-            name = candidate.node_name or (candidate.node_id or f"cluster_{candidate.index}")
+        for i, cluster in enumerate(clusters, start=1):
+            cap_name = cluster.capability_name
+            if cluster.capability_name_zh:
+                cap_name = f"{cluster.capability_name} / {cluster.capability_name_zh}"
+            cap_def = self._clip_text(cluster.capability_definition or "N/A", cluster_definition_max_chars)
             lines.append(
-                f"{i}. index={candidate.index} | name={name} | node_id={candidate.node_id or 'N/A'} | path={path}"
+                f"{i}. id={cluster.node_id} | name={cap_name} | definition={cap_def}"
             )
 
         cluster_block = "\n".join(lines)
@@ -630,19 +530,20 @@ class DeepSeekDeltaArrayScorer:
 
         raw = self._call_deepseek_text(user_input, max_tokens=quality_max_tokens)
         if not raw:
-            return [3.0] * len(candidates)
+            return [3.0] * len(clusters)
 
         obj = self._extract_json_object(raw)
         if obj is not None:
             scores = obj.get("scores")
             if isinstance(scores, list):
-                return self._normalize_batch_scores(scores, expected_len=len(candidates))
+                return self._normalize_batch_scores(scores, expected_len=len(clusters))
 
+        # Fallback: try to parse digits from plain text if JSON formatting failed.
         digits = re.findall(r"(?<!\d)([1-6])(?!\d)", raw)
         if digits:
-            return self._normalize_batch_scores(digits, expected_len=len(candidates))
+            return self._normalize_batch_scores(digits, expected_len=len(clusters))
 
-        return [3.0] * len(candidates)
+        return [3.0] * len(clusters)
 
     @staticmethod
     def _aggregate_turn_vectors(vectors: List[List[float]], mode: str) -> List[float]:
@@ -663,15 +564,13 @@ class DeepSeekDeltaArrayScorer:
     def _score_one_sample(
         self,
         sample: Dict[str, Any],
-        sample_id: Any,
-        routed_item: RoutedItem,
-        m_dimensions: int,
+        clusters: List[CapabilityCluster],
         turn_aggregation: str,
         store_turn_scores: bool,
-        attach_routing_meta: bool,
+        attach_cluster_meta: bool,
         quality_mode: str,
         cluster_batch_size: int,
-        cluster_path_max_chars: int,
+        cluster_definition_max_chars: int,
         quality_max_tokens: int,
     ) -> Dict[str, Any]:
         turns = self._extract_turns(sample)
@@ -682,71 +581,58 @@ class DeepSeekDeltaArrayScorer:
             response = str(turn.get("response", ""))
 
             complexity_score = float(self.infer_complexity(instruction))
-            delta_vector: List[float] = [0.0] * m_dimensions
+            delta_vector: List[float] = [0.0] * len(clusters)
 
             if quality_mode == "single":
-                for candidate in routed_item.candidates:
-                    if candidate.index < 0 or candidate.index >= m_dimensions:
-                        continue
-                    quality_score = float(self.infer_quality_for_candidate(instruction, response, candidate))
-                    delta_vector[candidate.index] += float(complexity_score * quality_score)
+                for i, cluster in enumerate(clusters):
+                    quality_score = float(self.infer_quality_for_cluster(instruction, response, cluster))
+                    delta_vector[i] = float(complexity_score * quality_score)
             else:
                 bs = max(1, cluster_batch_size)
                 start = 0
-                while start < len(routed_item.candidates):
-                    end = min(start + bs, len(routed_item.candidates))
-                    chunk = routed_item.candidates[start:end]
-                    quality_scores = self.infer_quality_for_candidate_batch(
+                while start < len(clusters):
+                    end = min(start + bs, len(clusters))
+                    chunk = clusters[start:end]
+                    quality_scores = self.infer_quality_for_cluster_batch(
                         input_text=instruction,
                         resp_text=response,
-                        candidates=chunk,
-                        cluster_path_max_chars=cluster_path_max_chars,
+                        clusters=chunk,
+                        cluster_definition_max_chars=cluster_definition_max_chars,
                         quality_max_tokens=quality_max_tokens,
                     )
                     for j, quality_score in enumerate(quality_scores):
-                        idx = chunk[j].index
-                        if idx < 0 or idx >= m_dimensions:
-                            continue
-                        delta_vector[idx] += float(complexity_score * float(quality_score))
+                        delta_vector[start + j] = float(complexity_score * float(quality_score))
                     start = end
 
             turn_vectors.append(delta_vector)
 
-        mapped_vector = self._aggregate_turn_vectors(turn_vectors, turn_aggregation)
-        if len(mapped_vector) != m_dimensions:
-            mapped_vector = (mapped_vector + [0.0] * m_dimensions)[:m_dimensions]
-
-        sample["id"] = sample_id
-        sample["mapped_vector"] = mapped_vector
-        sample["score"] = mapped_vector
-        sample["score_type"] = "delta_array_mapped_vector"
+        sample["score"] = self._aggregate_turn_vectors(turn_vectors, turn_aggregation)
+        sample["score_type"] = "delta_array"
         sample["score_turn_aggregation"] = turn_aggregation
 
         if store_turn_scores:
             sample["score_by_turn"] = turn_vectors
 
-        if attach_routing_meta:
-            sample["top_k_indices"] = routed_item.top_k_indices
-            sample["top_k_scores"] = routed_item.top_k_scores
-            sample["top_k_node_ids"] = routed_item.top_k_node_ids
-            sample["top_k_node_names"] = routed_item.top_k_node_names
-            sample["top_k_node_paths"] = routed_item.top_k_node_paths
+        if attach_cluster_meta:
+            sample["score_cluster_ids"] = [c.node_id for c in clusters]
+            sample["score_cluster_names"] = [c.capability_name for c in clusters]
+            sample["score_cluster_names_zh"] = [c.capability_name_zh for c in clusters]
+            sample["score_cluster_sizes"] = [c.cluster_size for c in clusters]
 
         return sample
 
     def score_dataset(
         self,
         data: List[Dict[str, Any]],
-        routing_map: Dict[str, RoutedItem],
-        m_dimensions: int,
+        clusters: List[CapabilityCluster],
         concurrency: int = 1,
         max_samples: int = -1,
         turn_aggregation: str = "sum",
         store_turn_scores: bool = False,
-        attach_routing_meta: bool = True,
+        attach_cluster_meta: bool = True,
         quality_mode: str = "batch",
-        cluster_batch_size: int = 5,
-        cluster_path_max_chars: int = 180,
+        cluster_batch_size: int = 12,
+        cluster_definition_max_chars: int = 120,
         quality_max_tokens: int = 512,
     ) -> List[Dict[str, Any]]:
         if max_samples is not None and max_samples >= 0:
@@ -758,43 +644,34 @@ class DeepSeekDeltaArrayScorer:
         if concurrency == 1:
             iterator = tqdm(data, total=len(data), desc="Scoring samples") if tqdm else data
             for idx, sample in enumerate(iterator):
-                sample_id, routed_item = self._resolve_sample_routing(sample, idx, routing_map)
                 data[idx] = self._score_one_sample(
                     sample=sample,
-                    sample_id=sample_id,
-                    routed_item=routed_item,
-                    m_dimensions=m_dimensions,
+                    clusters=clusters,
                     turn_aggregation=turn_aggregation,
                     store_turn_scores=store_turn_scores,
-                    attach_routing_meta=attach_routing_meta,
+                    attach_cluster_meta=attach_cluster_meta,
                     quality_mode=quality_mode,
                     cluster_batch_size=cluster_batch_size,
-                    cluster_path_max_chars=cluster_path_max_chars,
+                    cluster_definition_max_chars=cluster_definition_max_chars,
                     quality_max_tokens=quality_max_tokens,
                 )
             return data
 
         results: List[Optional[Dict[str, Any]]] = [None] * len(data)
-
-        def worker(index: int, row: Dict[str, Any]) -> Dict[str, Any]:
-            sample_id, routed_item = self._resolve_sample_routing(row, index, routing_map)
-            return self._score_one_sample(
-                sample=row,
-                sample_id=sample_id,
-                routed_item=routed_item,
-                m_dimensions=m_dimensions,
-                turn_aggregation=turn_aggregation,
-                store_turn_scores=store_turn_scores,
-                attach_routing_meta=attach_routing_meta,
-                quality_mode=quality_mode,
-                cluster_batch_size=cluster_batch_size,
-                cluster_path_max_chars=cluster_path_max_chars,
-                quality_max_tokens=quality_max_tokens,
-            )
-
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = {
-                executor.submit(worker, idx, sample): idx
+                executor.submit(
+                    self._score_one_sample,
+                    sample,
+                    clusters,
+                    turn_aggregation,
+                    store_turn_scores,
+                    attach_cluster_meta,
+                    quality_mode,
+                    cluster_batch_size,
+                    cluster_definition_max_chars,
+                    quality_max_tokens,
+                ): idx
                 for idx, sample in enumerate(data)
             }
 
@@ -814,28 +691,11 @@ class DeepSeekDeltaArrayScorer:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compute top-k routed DEITA delta score vectors with DeepSeek API."
+        description="Compute cluster-conditional DEITA delta score arrays with DeepSeek API."
     )
     parser.add_argument("--data_path", type=str, required=True, help="Input dataset path (JSON or JSONL).")
-    parser.add_argument(
-        "--routing_path",
-        type=str,
-        required=True,
-        help="Coarse routing jsonl path (e.g. train_coarse_topk5.jsonl).",
-    )
+    parser.add_argument("--cluster_path", type=str, required=True, help="Capability cluster jsonl path.")
     parser.add_argument("--output_path", type=str, required=True, help="Output path for scored JSON or JSONL.")
-    parser.add_argument(
-        "--m_dimensions",
-        type=int,
-        default=None,
-        help="Capability dimension m. If omitted, infer from routing top_k_indices.",
-    )
-    parser.add_argument(
-        "--max_top_k",
-        type=int,
-        default=5,
-        help="Use at most top-k routed clusters per sample for quality prompts; <=0 means all.",
-    )
     parser.add_argument(
         "--api_key",
         type=str,
@@ -866,6 +726,38 @@ def parse_args() -> argparse.Namespace:
         default=-1,
         help="Only score first N samples. Use -1 to score all samples.",
     )
+    parser.add_argument("--min_cluster_size", type=int, default=1, help="Skip clusters smaller than this size.")
+    parser.add_argument("--max_clusters", type=int, default=-1, help="Use only first N clusters by order; -1=all.")
+    parser.add_argument(
+        "--cluster_id_field",
+        type=str,
+        default="node_id",
+        help="Field name for cluster id in cluster jsonl.",
+    )
+    parser.add_argument(
+        "--cluster_order_field",
+        type=str,
+        default="order",
+        help="Field name for cluster order in cluster jsonl.",
+    )
+    parser.add_argument(
+        "--cluster_name_field",
+        type=str,
+        default="capability_name",
+        help="Field name for cluster English name in cluster jsonl.",
+    )
+    parser.add_argument(
+        "--cluster_name_zh_field",
+        type=str,
+        default="capability_name_zh",
+        help="Field name for cluster Chinese name in cluster jsonl.",
+    )
+    parser.add_argument(
+        "--cluster_definition_field",
+        type=str,
+        default="capability_definition",
+        help="Field name for cluster definition in cluster jsonl.",
+    )
     parser.add_argument(
         "--turn_aggregation",
         type=str,
@@ -878,19 +770,19 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=["batch", "single"],
         default="batch",
-        help="batch: one request scores all top-k clusters by chunk; single: one request per cluster.",
+        help="batch: one request scores a chunk of clusters; single: one request per cluster.",
     )
     parser.add_argument(
         "--cluster_batch_size",
         type=int,
-        default=5,
-        help="How many routed clusters to score per quality request when --quality_mode=batch.",
+        default=12,
+        help="How many clusters to score per quality request when --quality_mode=batch.",
     )
     parser.add_argument(
-        "--cluster_path_max_chars",
+        "--cluster_definition_max_chars",
         type=int,
-        default=180,
-        help="Max chars of cluster path included in batch quality prompt.",
+        default=120,
+        help="Max chars of cluster definition included in batch quality prompt.",
     )
     parser.add_argument(
         "--quality_max_tokens",
@@ -905,10 +797,10 @@ def parse_args() -> argparse.Namespace:
         help="Whether to store score_by_turn (larger output).",
     )
     parser.add_argument(
-        "--attach_routing_meta",
+        "--attach_cluster_meta",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Whether to store routed top-k metadata alongside scores.",
+        help="Whether to store cluster id/name arrays alongside scores.",
     )
     return parser.parse_args()
 
@@ -925,68 +817,57 @@ def main() -> None:
         retry_backoff=args.retry_backoff,
     )
 
-    data, input_format = scorer._load_json_or_jsonl(args.data_path)
-    routing_map, inferred_m = scorer._load_routing_jsonl(
-        routing_path=args.routing_path,
-        max_top_k=int(args.max_top_k),
+    clusters = scorer._load_clusters_jsonl(
+        cluster_path=args.cluster_path,
+        cluster_id_field=args.cluster_id_field,
+        cluster_order_field=args.cluster_order_field,
+        cluster_name_field=args.cluster_name_field,
+        cluster_name_zh_field=args.cluster_name_zh_field,
+        cluster_definition_field=args.cluster_definition_field,
+        min_cluster_size=max(1, args.min_cluster_size),
+        max_clusters=args.max_clusters,
     )
+    if not clusters:
+        raise ValueError("No valid clusters loaded. Check --cluster_path and filter args.")
 
-    if not routing_map:
-        raise ValueError("No valid routed rows loaded. Check --routing_path.")
-
-    if args.m_dimensions is None:
-        m_dimensions = int(inferred_m)
-        logger.info("m_dimensions inferred from routing indices: %d", m_dimensions)
-    else:
-        if args.m_dimensions <= 0:
-            raise ValueError("--m_dimensions must be > 0")
-        m_dimensions = int(args.m_dimensions)
-        if m_dimensions < inferred_m:
-            raise ValueError(
-                f"--m_dimensions={m_dimensions} is too small; routing requires >= {inferred_m}."
-            )
-
+    data, input_format = scorer._load_json_or_jsonl(args.data_path)
     logger.info("Loaded %d samples from %s", len(data), args.data_path)
-    logger.info("Loaded %d routed rows from %s", len(routing_map), args.routing_path)
+    logger.info("Loaded %d capability clusters from %s", len(clusters), args.cluster_path)
     if args.max_samples >= 0:
         logger.info("Scoring first %d samples (--max_samples).", min(args.max_samples, len(data)))
     logger.info("Using concurrency=%d", args.concurrency)
     logger.info("Turn aggregation=%s", args.turn_aggregation)
     logger.info(
-        "Quality mode=%s, cluster_batch_size=%d, m_dimensions=%d",
+        "Quality mode=%s, cluster_batch_size=%d",
         args.quality_mode,
         max(1, args.cluster_batch_size),
-        m_dimensions,
     )
-
     scoring_data = data if args.max_samples < 0 else data[: args.max_samples]
     turn_count = sum(len(scorer._extract_turns(sample)) for sample in scoring_data)
-    max_top_k = max(1, int(args.max_top_k)) if int(args.max_top_k) != 0 else 1
     if args.quality_mode == "batch":
-        calls_per_turn = 1 + math.ceil(max_top_k / max(1, args.cluster_batch_size))
+        calls_per_turn = 1 + math.ceil(len(clusters) / max(1, args.cluster_batch_size))
     else:
-        calls_per_turn = 1 + max_top_k
+        calls_per_turn = 1 + len(clusters)
     estimated_calls = turn_count * calls_per_turn
     logger.info(
-        "Estimated API calls: %d (turns=%d, approx_calls_per_turn=%d, top_k<=%d)",
+        "Estimated API calls: %d (turns=%d, calls_per_turn=%d, clusters=%d)",
         estimated_calls,
         turn_count,
         calls_per_turn,
-        max_top_k,
+        len(clusters),
     )
 
     scored_data = scorer.score_dataset(
         data=data,
-        routing_map=routing_map,
-        m_dimensions=m_dimensions,
+        clusters=clusters,
         concurrency=args.concurrency,
         max_samples=args.max_samples,
         turn_aggregation=args.turn_aggregation,
         store_turn_scores=bool(args.store_turn_scores),
-        attach_routing_meta=bool(args.attach_routing_meta),
+        attach_cluster_meta=bool(args.attach_cluster_meta),
         quality_mode=args.quality_mode,
         cluster_batch_size=max(1, args.cluster_batch_size),
-        cluster_path_max_chars=max(32, args.cluster_path_max_chars),
+        cluster_definition_max_chars=max(32, args.cluster_definition_max_chars),
         quality_max_tokens=max(128, args.quality_max_tokens),
     )
 
