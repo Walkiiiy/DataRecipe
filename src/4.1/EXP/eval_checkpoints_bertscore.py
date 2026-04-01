@@ -67,6 +67,8 @@ class EvalConfig:
     bertscore_model_en: str
     bertscore_model_zh: str
     bertscore_model_multilingual: str
+    bertscore_model_source: str
+    bertscore_modelscope_cache_dir: Path | None
     bertscore_batch_size: int
     bertscore_nthreads: int
     bertscore_rescale_with_baseline: bool
@@ -174,6 +176,19 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="xlm-roberta-large",
         help="BERTScore encoder model for multilingual mode.",
+    )
+    parser.add_argument(
+        "--bertscore-model-source",
+        type=str,
+        choices=["modelscope", "hf"],
+        default="modelscope",
+        help="Source for BERTScore encoder models.",
+    )
+    parser.add_argument(
+        "--bertscore-modelscope-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional ModelScope cache dir for BERTScore models.",
     )
     parser.add_argument("--bertscore-batch-size", type=int, default=16)
     parser.add_argument("--bertscore-nthreads", type=int, default=4)
@@ -300,6 +315,50 @@ def resolve_model_path(model_name_or_path: str, model_source: str, cache_dir: Pa
         model_id=model_name_or_path,
         cache_dir=str(cache_dir) if cache_dir is not None else None,
     )
+
+
+def _candidate_modelscope_ids(model_name_or_path: str) -> list[str]:
+    candidates = [model_name_or_path]
+    if "/" not in model_name_or_path:
+        candidates.append(f"AI-ModelScope/{model_name_or_path}")
+        candidates.append(f"damo/{model_name_or_path}")
+    # keep stable order and deduplicate
+    out: list[str] = []
+    seen = set()
+    for c in candidates:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def resolve_metric_model_path(model_name_or_path: str, model_source: str, cache_dir: Path | None) -> str:
+    local_path = Path(model_name_or_path)
+    if local_path.exists():
+        return str(local_path)
+    if model_source == "hf":
+        return model_name_or_path
+    if snapshot_download is None:
+        raise ImportError("ModelScope is not installed. Please install: pip install modelscope")
+
+    candidates = _candidate_modelscope_ids(model_name_or_path)
+    last_exc: Exception | None = None
+    tried: list[str] = []
+    for model_id in candidates:
+        try:
+            return snapshot_download(
+                model_id=model_id,
+                cache_dir=str(cache_dir) if cache_dir is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            tried.append(model_id)
+    tried_str = ", ".join(tried)
+    raise RuntimeError(
+        f"Failed to resolve BERTScore model `{model_name_or_path}` from ModelScope. "
+        f"Tried: [{tried_str}]. You can pass a valid ModelScope id via "
+        "`--bertscore-model-en/--bertscore-model-zh/--bertscore-model-multilingual`."
+    ) from last_exc
 
 
 def get_dtype() -> torch.dtype:
@@ -772,6 +831,8 @@ def main() -> None:
         bertscore_model_en=args.bertscore_model_en,
         bertscore_model_zh=args.bertscore_model_zh,
         bertscore_model_multilingual=args.bertscore_model_multilingual,
+        bertscore_model_source=args.bertscore_model_source,
+        bertscore_modelscope_cache_dir=args.bertscore_modelscope_cache_dir,
         bertscore_batch_size=max(1, args.bertscore_batch_size),
         bertscore_nthreads=max(1, args.bertscore_nthreads),
         bertscore_rescale_with_baseline=bool(args.bertscore_rescale_with_baseline),
@@ -782,6 +843,26 @@ def main() -> None:
         continue_on_error=bool(args.continue_on_error),
         device=args.device,
     )
+
+    bertscore_cache_dir = cfg.bertscore_modelscope_cache_dir or cfg.modelscope_cache_dir
+    if cfg.bertscore_lang_mode in {"auto", "en"}:
+        cfg.bertscore_model_en = resolve_metric_model_path(
+            cfg.bertscore_model_en,
+            cfg.bertscore_model_source,
+            bertscore_cache_dir,
+        )
+    if cfg.bertscore_lang_mode in {"auto", "zh"}:
+        cfg.bertscore_model_zh = resolve_metric_model_path(
+            cfg.bertscore_model_zh,
+            cfg.bertscore_model_source,
+            bertscore_cache_dir,
+        )
+    if cfg.bertscore_lang_mode == "multilingual":
+        cfg.bertscore_model_multilingual = resolve_metric_model_path(
+            cfg.bertscore_model_multilingual,
+            cfg.bertscore_model_source,
+            bertscore_cache_dir,
+        )
 
     if not cfg.eval_source_jsonl.exists():
         raise FileNotFoundError(f"Eval source jsonl not found: {cfg.eval_source_jsonl}")
@@ -834,6 +915,13 @@ def main() -> None:
     metric_device = resolve_metric_device(cfg.bertscore_device, device)
     logging.info("Generation device: %s", device)
     logging.info("BERTScore device: %s", metric_device)
+    logging.info("BERTScore model source: %s", cfg.bertscore_model_source)
+    if cfg.bertscore_lang_mode in {"auto", "en"}:
+        logging.info("BERTScore EN model: %s", cfg.bertscore_model_en)
+    if cfg.bertscore_lang_mode in {"auto", "zh"}:
+        logging.info("BERTScore ZH model: %s", cfg.bertscore_model_zh)
+    if cfg.bertscore_lang_mode == "multilingual":
+        logging.info("BERTScore multilingual model: %s", cfg.bertscore_model_multilingual)
     logging.info(
         "Runs=%d | eval_items=%d | normalize=%s | lang_mode=%s",
         len(cfg.runs),

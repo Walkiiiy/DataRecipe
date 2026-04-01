@@ -222,8 +222,8 @@ python src/4.1/EXP/eval_checkpoints_em.py \
   --eval-size 1446 \
   --base_model Qwen/Qwen2.5-0.5B \
   --model_source modelscope \
-  --run random::data/lawyer/exp4.2/run_random_1000_shared_eval/checkpoint-128 \
-  --run srm::data/lawyer/exp4.2/run_srm_1000_shared_eval/checkpoint-128
+  --run random::data/lawyer/exp4.2/run_random_1000_shared_eval/final_checkpoint \
+  --run srm::data/lawyer/exp4.2/run_srm_1000_shared_eval/final_checkpoint
 
 
   --run delta_origin::data/lawyer/exp4.2/run_delta_origin_1000_shared_eval/final_checkpoint \
