@@ -1,3 +1,8 @@
+# train 重新划分
+python3 src/scripts/split_train_test_random.py \
+  --train-jsonl data/dialogsum/train.jsonl
+
+
 # 能力树
 - 重构4.1为模型聚类
 - python3 /home/walkiiiy/DataRecipe/src/4.1/llm_capability_tree_builder.py \
@@ -34,7 +39,7 @@ python3 src/4.2/stage_2_top_k_routing.py \
 
 export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
 # 评分
-- SRM
+# SRM
 - python3 src/4.2/SRM/SRM.py \
   --input_path data/dialogsum/train_coarse_topk5.jsonl \
   --data_path data/dialogsum/train.jsonl \
@@ -47,20 +52,13 @@ export DEEPSEEK_API_KEY="sk-ab412f420cd540888da4732a35600c4a"
 python3 /home/walkiiiy/DataRecipe/src/4.2/SRM/srm_sample.py \
   --score_path /home/walkiiiy/DataRecipe/data/dialogsum/score/srm_from_topk5_only.jsonl \
   --data_path /home/walkiiiy/DataRecipe/data/dialogsum/train.jsonl \
-  --output_path /home/walkiiiy/DataRecipe/data/dialogsum/exp4.2/dataset_srm.jsonl \
+  --output_path /home/walkiiiy/DataRecipe/data/dialogsum/exp4.2/dataset_srm_1000.jsonl \
   --num_samples 1000
 
-python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run srm::data/dialogsum/exp4.2/dataset_srm.jsonl::data/dialogsum/exp4.2/run_srm_shared_eval \
-  --eval-source-jsonl data/dialogsum/train.jsonl \
-  --eval-ratio 0.01 \
-  --seed 42 \
-  --num_train_epochs 6 \
-  --output-root data/dialogsum/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct 
+
 
 ------------------------------------------------------------------------------------------------
-- delta_improved（用 train_coarse_topk5.jsonl 的 top5 names 构 prompt，输出统一 mapped_vector）
+# delta_improved（用 train_coarse_topk5.jsonl 的 top5 names 构 prompt，输出统一 mapped_vector）
 python3 src/4.2/delta/delta_improved.py \
   --data_path data/dialogsum/train.jsonl \
   --routing_path data/dialogsum/train_coarse_topk5.jsonl \
@@ -72,50 +70,33 @@ python3 src/4.2/delta/delta_improved.py \
 python3 /home/walkiiiy/DataRecipe/src/4.2/delta/delta_improved_sample.py \
   --score_path /home/walkiiiy/DataRecipe/data/dialogsum/score/delta_improved_mapped.jsonl \
   --data_path /home/walkiiiy/DataRecipe/data/dialogsum/train.jsonl \
-  --output_path /home/walkiiiy/DataRecipe/data/dialogsum/selected/dataset_delta_improved.jsonl \
+  --output_path /home/walkiiiy/DataRecipe/data/dialogsum/exp4.2/dataset_delta_improved_1000.jsonl \
   --num_samples 1000
 
-python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run srm::data/banking77/exp4.2/dataset_delta_improved.jsonl::data/banking77/exp4.2/run_delta_improved_shared_eval \
-  --eval-source-jsonl data/banking77/train.jsonl \
-  --eval-ratio 0.01 \
-  --seed 42 \
-  --num_train_epochs 4 \
-  --output-root data/banking77/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct 
 ============================================================================
 
 # delta_origin（输出统一 mapped_vector）
 python3 src/4.2/delta/delta_origin.py \
-  --data_path data/banking77/train.jsonl \
-  --routing_path data/banking77/train_coarse_topk5.jsonl \
-  --output_path data/banking77/score/delta_origin_mapped.jsonl \
+  --data_path data/dialogsum/train.jsonl \
+  --routing_path data/dialogsum/train_coarse_topk5.jsonl \
+  --output_path data/dialogsum/score/delta_origin_mapped.jsonl \
   --concurrency 16 \
   --turn_aggregation sum \
   --routing_weight_mode coarse
 
 python3 /home/walkiiiy/DataRecipe/src/4.2/delta/delta_origin_sample.py \
-  --score_path /home/walkiiiy/DataRecipe/data/banking77/score/delta_origin_mapped.jsonl \
-  --data_path /home/walkiiiy/DataRecipe/data/banking77/train.jsonl \
-  --output_path /home/walkiiiy/DataRecipe/data/banking77/exp4.2/dataset_delta_origin.jsonl \
-  --meta_output_path /home/walkiiiy/DataRecipe/data/banking77/selected/delta_origin_selected_3000_meta.json \
+  --score_path /home/walkiiiy/DataRecipe/data/dialogsum/score/delta_origin_mapped.jsonl \
+  --data_path /home/walkiiiy/DataRecipe/data/dialogsum/train.jsonl \
+  --output_path /home/walkiiiy/DataRecipe/data/dialogsum/exp4.2/dataset_delta_origin_1000.jsonl \
   --num_samples 1000
 
-python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run srm::data/banking77/exp4.2/dataset_delta_origin.jsonl::data/banking77/exp4.2/run_delta_origin_shared_eval \
-  --eval-source-jsonl data/banking77/train.jsonl \
-  --eval-ratio 0.01 \
-  --seed 42 \
-  --num_train_epochs 4 \
-  --output-root data/banking77/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct 
 =========================================================================================
 
 
 #  alpagasus_origin：原始标量评分（不做能力簇评分）
 python3 src/4.2/alpagasus/alpagasus_origin.py \
-  --data_path data/banking77/train.jsonl \
-  --output_path data/banking77/score/alpagasus_origin_scored.jsonl \
+  --data_path data/dialogsum/train.jsonl \
+  --output_path data/dialogsum/score/alpagasus_origin_scored.jsonl \
   --model deepseek-chat \
   --base_url https://api.deepseek.com \
   --temperature 0.01 \
@@ -125,20 +106,11 @@ python3 src/4.2/alpagasus/alpagasus_origin.py \
 
 
 python3 /home/walkiiiy/DataRecipe/src/4.2/alpagasus/alpagasus_origin_sample.py \
-  --score_path /home/walkiiiy/DataRecipe/data/banking77/score/alpagasus_origin_scored.jsonl \
-  --data_path /home/walkiiiy/DataRecipe/data/banking77/train.jsonl \
-  --output_path /home/walkiiiy/DataRecipe/data/banking77/exp4.2/dataset_alpagasus_origin.jsonl \
-  --meta_output_path /home/walkiiiy/DataRecipe/data/banking77/selected/alpagasus_origin_selected_3000_meta.json \
+  --score_path /home/walkiiiy/DataRecipe/data/dialogsum/score/alpagasus_origin_scored.jsonl \
+  --data_path /home/walkiiiy/DataRecipe/data/dialogsum/train.jsonl \
+  --output_path /home/walkiiiy/DataRecipe/data/dialogsum/exp4.2/dataset_alpagasus_origin_1000.jsonl \
   --num_samples 1000
 
-python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run srm::data/banking77/exp4.2/dataset_alpagasus_origin.jsonl::data/banking77/exp4.2/run_alpagasus_origin_shared_eval \
-  --eval-source-jsonl data/banking77/train.jsonl \
-  --eval-ratio 0.01 \
-  --seed 42 \
-  --num_train_epochs 4 \
-  --output-root data/banking77/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct 
 ==========================================================================================
 
 
@@ -155,23 +127,6 @@ python3 src/4.2/alpagasus/alpagasus_improved.py \
   --routing_weight_mode coarse \
   --concurrency 16
 
-
-python3 /home/walkiiiy/DataRecipe/src/4.2/alpagasus/alpagasus_improved_sample.py \
-  --score_path /home/walkiiiy/DataRecipe/data/banking77/score/alpagasus_improved_mapped.jsonl \
-  --data_path /home/walkiiiy/DataRecipe/data/banking77/train.jsonl \
-  --output_path /home/walkiiiy/DataRecipe/data/banking77/exp4.2/dataset_alpagasus_improved.jsonl \
-  --meta_output_path /home/walkiiiy/DataRecipe/data/banking77/selected/alpagasus_improved_selected_3000_meta.json \
-  --num_samples 1000
-
-
-python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run srm::data/banking77/exp4.2/dataset_alpagasus_improved.jsonl::data/banking77/exp4.2/run_alpagasus_improved_shared_eval \
-  --eval-source-jsonl data/banking77/train.jsonl \
-  --eval-ratio 0.01 \
-  --seed 42 \
-  --num_train_epochs 4 \
-  --output-root data/banking77/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct 
 
 ================================================================================
 # instag
@@ -211,16 +166,6 @@ python3 src/4.2/instag/instag_sample.py \
 
 
 
-- 先对这两个跑实验
-python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run instag::data/banking77/exp4.2/dataset_instag.jsonl::data/banking77/exp4.2/run_instag_shared_eval \
-  --run mig::data/banking77/exp4.2/dataset_mig.jsonl::data/banking77/exp4.2/run_mig_shared_eval \
-  --eval-source-jsonl data/banking77/train.jsonl \
-  --eval-ratio 0.01 \
-  --seed 42 \
-  --num_train_epochs 4 \
-  --output-root data/banking77/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct \
 
 ============================================================================
 
@@ -239,49 +184,54 @@ python3 src/4.2/datawhisperer/datawhisperer.py \
   --max_input_tokens 2048 \
   --select_top_k 1000
 
-python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run instag::data/banking77/exp4.2/dataset_datawhisperer.jsonl::data/banking77/exp4.2/run_datawhisperer_shared_eval \
-  --eval-source-jsonl data/banking77/train.jsonl \
-  --eval-ratio 0.01 \
-  --seed 42 \
-  --num_train_epochs 4 \
-  --output-root data/banking77/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct
 
 ===============================================================================================
-- 随机采样
+# 随机采样
 python src/scripts/sample_train_subset.py \
   --input-jsonl data/dialogsum/train.jsonl \
-  --output-jsonl data/dialogsum/exp4.2/dataset_random.jsonl \
+  --output-jsonl data/dialogsum/exp4.2/dataset_random_1000.jsonl \
   --sample-size 1000 \
   --seed 42
 
+
+
+# 训练
 python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run instag::data/banking77/exp4.2/dataset_random.jsonl::data/banking77/exp4.2/run_random_shared_eval \
-  --eval-source-jsonl data/banking77/train.jsonl \
-  --eval-ratio 0.01 \
+  --run srm::data/dialogsum/exp4.2/dataset_srm_1000.jsonl::data/dialogsum/exp4.2/run_srm_1000_shared_eval \
+  --run random::data/dialogsum/exp4.2/dataset_random_1000.jsonl::data/dialogsum/exp4.2/run_random_1000_shared_eval \
+  --run delta_improved::data/dialogsum/exp4.2/dataset_delta_improved_1000.jsonl::data/dialogsum/exp4.2/run_delta_improved_1000_shared_eval \
+  --run delta_origin::data/dialogsum/exp4.2/dataset_delta_origin_1000.jsonl::data/dialogsum/exp4.2/run_delta_origin_1000_shared_eval \
+  --run alpagasus_origin::data/dialogsum/exp4.2/dataset_alpagasus_origin_1000.jsonl::data/dialogsum/exp4.2/run_alpagasus_origin_1000_shared_eval \
+  --eval-source-jsonl data/dialogsum/test.jsonl \
+  --eval-ratio 1 \
   --seed 42 \
   --num_train_epochs 4 \
-  --output-root data/banking77/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B-Instruct
-
-
-  --sample-ratio 0.1 \
-
+  --output-root data/dialogsum/exp/shared_eval \
+  --base_model Qwen/Qwen2.5-0.5B
+  <!-- --base_model Qwen/Qwen3-4B-Instruct-2507   JunHowie/Qwen3-8B-Instruct -->
 
 # EM评估
 python src/4.1/EXP/eval_checkpoints_em.py \
-  --eval-source-jsonl data/banking77/train.jsonl \
-  --eval-size 500 \
+  --eval-source-jsonl data/dialogsum/test.jsonl \
+  --eval-size 1446 \
   --base_model Qwen/Qwen2.5-0.5B \
   --model_source modelscope \
-  --run ours::data/banking77/exp4.2/run_ours_shared_eval/final_checkpoint \
-  --run random::data/banking77/exp4.2/run_random_shared_eval/final_checkpoint \
-  --run instag::data/banking77/exp4.2/run_instag_shared_eval/final_checkpoint \
-  --run datawhisperer::data/banking77/exp4.2/run_datawhisperer_shared_eval/final_checkpoint \
-  --run delta_origin::data/banking77/exp4.2/run_delta_origin_shared_eval/final_checkpoint \
-  --run delta_improved::data/banking77/exp4.2/run_delta_improved_shared_eval/final_checkpoint \
-  --run delta_origin::data/banking77/exp4.2/run_delta_origin_shared_eval/final_checkpoint \
-  --run alpagasus_improved::data/banking77/exp4.2/run_alpagasus_improved_shared_eval/final_checkpoint \
-  --run alpagasus_origin::data/banking77/exp4.2/run_alpagasus_origin_shared_eval/final_checkpoint \
-  --output-dir data/banking77/exp4.2/em_eval
+  --run delta_origin::data/dialogsum/exp4.2/run_delta_origin_1000_shared_eval/final_checkpoint \
+
+  --run alpagasus_origin::data/dialogsum/exp4.2/run_alpagasus_origin_1000_shared_eval/final_checkpoint 
+
+
+  --run random::data/dialogsum/exp4.2/run_random_1000_shared_eval/final_checkpoint \
+  --run delta_improved::data/dialogsum/exp4.2/run_delta_improved_1000_shared_eval/final_checkpoint \
+
+
+  --run srm::data/dialogsum/exp4.2/run_srm_1000_shared_eval/final_checkpoint \
+
+
+
+
+
+  run_delta_origin_1000_shared_eval/final_checkpoint \
+  --run alpagasus_origin::data/dialogsum/exp4.2/
+  run_alpagasus_origin_1000_shared_eval/final_checkpoint \
+  --output-dir data/dialogsum/exp4.2/em_eval

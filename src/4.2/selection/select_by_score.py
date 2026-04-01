@@ -334,9 +334,11 @@ def materialize_rows(
     gains: Optional[List[float]],
     data_map: Optional[Dict[str, Dict[str, Any]]],
     annotate_selection: bool,
+    strict_data_restore: bool,
 ) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     missing_in_data_map = 0
+    missing_ids: List[str] = []
 
     for rank, cand_idx in enumerate(selected_indices):
         cand = candidates[cand_idx]
@@ -345,6 +347,8 @@ def materialize_rows(
             base = data_map.get(cand.row_id_key)
             if base is None:
                 missing_in_data_map += 1
+                if len(missing_ids) < 20:
+                    missing_ids.append(cand.row_id_key)
 
         row_out = dict(base) if base is not None else dict(cand.raw_row)
         if row_out.get("id") is None:
@@ -363,6 +367,13 @@ def materialize_rows(
         out.append(row_out)
 
     if data_map is not None and missing_in_data_map > 0:
+        if strict_data_restore:
+            sample_ids = ", ".join(missing_ids[:10])
+            raise ValueError(
+                "Selected rows missing in data_path by id: "
+                f"{missing_in_data_map}. Example missing ids: [{sample_ids}]. "
+                "score_path and data_path are likely misaligned."
+            )
         logger.warning(
             "Selected rows missing in data_path by id: %d (fallback to score rows).",
             missing_in_data_map,
@@ -402,6 +413,8 @@ def run_selection(
     allow_fallback_fields: bool = True,
     annotate_selection: bool = False,
     meta_output_path: Optional[str] = None,
+    strict_data_restore: bool = False,
+    restrict_to_data_ids: bool = False,
 ) -> Dict[str, Any]:
     if int(num_samples) <= 0:
         raise ValueError("--num_samples must be > 0.")
@@ -426,6 +439,28 @@ def run_selection(
     if chosen_strategy not in {"vector_greedy", "scalar_topk"}:
         raise ValueError(f"Unsupported strategy: {chosen_strategy}")
 
+    data_map: Optional[Dict[str, Dict[str, Any]]] = None
+    if data_path:
+        data_rows, _ = load_json_or_jsonl(data_path)
+        data_map = build_data_map(data_rows, id_field=id_field)
+        logger.info("Loaded original data rows=%d from %s", len(data_rows), data_path)
+
+        if bool(restrict_to_data_ids):
+            before = len(candidates)
+            candidates = [c for c in candidates if c.row_id_key in data_map]
+            dropped = before - len(candidates)
+            if dropped > 0:
+                logger.warning(
+                    "Filtered score rows not present in data_path ids: dropped=%d, kept=%d.",
+                    dropped,
+                    len(candidates),
+                )
+            if not candidates:
+                raise ValueError(
+                    "No score rows remain after id filtering by data_path. "
+                    "score_path and data_path may be fully misaligned."
+                )
+
     if chosen_strategy == "vector_greedy":
         valid_vec = sum(1 for c in candidates if c.vector)
         if valid_vec == 0:
@@ -448,12 +483,6 @@ def run_selection(
         selected_indices = select_scalar_topk(candidates, int(num_samples))
         gains = None
 
-    data_map: Optional[Dict[str, Dict[str, Any]]] = None
-    if data_path:
-        data_rows, _ = load_json_or_jsonl(data_path)
-        data_map = build_data_map(data_rows, id_field=id_field)
-        logger.info("Loaded original data rows=%d from %s", len(data_rows), data_path)
-
     selected_rows = materialize_rows(
         candidates,
         selected_indices,
@@ -461,6 +490,7 @@ def run_selection(
         gains=gains,
         data_map=data_map,
         annotate_selection=annotate_selection,
+        strict_data_restore=bool(strict_data_restore),
     )
 
     write_json_or_jsonl(output_path, selected_rows, prefer_jsonl=(score_fmt == "jsonl"))
@@ -479,6 +509,8 @@ def run_selection(
         "dimension_totals": dim_totals,
         "vector_field": vector_field,
         "scalar_field": scalar_field,
+        "strict_data_restore": bool(strict_data_restore),
+        "restrict_to_data_ids": bool(restrict_to_data_ids),
     }
 
     if meta_output_path:
@@ -521,6 +553,18 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Whether to add selection metadata fields into each output row.",
     )
+    parser.add_argument(
+        "--strict_data_restore",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true, fail when selected row id is missing in --data_path (no fallback to score rows).",
+    )
+    parser.add_argument(
+        "--restrict_to_data_ids",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true, pre-filter score rows by ids existing in --data_path before selection.",
+    )
     return parser.parse_args()
 
 
@@ -538,6 +582,8 @@ def main() -> None:
         scalar_field=args.scalar_field,
         allow_fallback_fields=bool(args.allow_fallback_fields),
         annotate_selection=bool(args.annotate_selection),
+        strict_data_restore=bool(args.strict_data_restore),
+        restrict_to_data_ids=bool(args.restrict_to_data_ids),
     )
 
 

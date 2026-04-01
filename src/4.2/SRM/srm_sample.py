@@ -30,6 +30,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_samples", type=int, required=True, help="Selection budget.")
     parser.add_argument("--id_field", type=str, default="id")
     parser.add_argument(
+        "--strict_data_restore",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If true, require selected ids to exist in --data_path (recommended for SRM).",
+    )
+    parser.add_argument(
+        "--restrict_to_data_ids",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="If true, pre-filter score rows by ids existing in --data_path before selection.",
+    )
+    parser.add_argument(
         "--annotate_selection",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -50,6 +62,8 @@ def main() -> None:
         id_field=args.id_field,
         vector_field="mapped_vector",
         allow_fallback_fields=True,
+        strict_data_restore=bool(args.strict_data_restore),
+        restrict_to_data_ids=bool(args.restrict_to_data_ids),
         annotate_selection=bool(args.annotate_selection),
     )
 

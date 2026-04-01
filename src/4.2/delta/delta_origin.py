@@ -141,8 +141,23 @@ class DeepSeekDeltaScorer:
                 return data, "json"
             raise ValueError("Input JSON must be a list of samples.")
         except json.JSONDecodeError:
-            lines = [line for line in text.splitlines() if line.strip()]
-            return [json.loads(line) for line in lines], "jsonl"
+            # NOTE:
+            # Avoid splitlines(): certain unicode separators (e.g. U+0085 NEL)
+            # can appear inside JSON string values and would break one JSON row
+            # into invalid fragments.
+            rows: List[Dict[str, Any]] = []
+            for line_no, raw in enumerate(text.split("\n"), start=1):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
+                if not isinstance(row, dict):
+                    raise ValueError(f"Invalid JSONL object at {path}:{line_no}: expected dict.")
+                rows.append(row)
+            return rows, "jsonl"
 
     @staticmethod
     def _extract_optional_list(row: Dict[str, Any], key: str) -> Optional[List[Any]]:
