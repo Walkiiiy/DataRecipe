@@ -60,6 +60,7 @@ class EvalConfig:
     temperature: float
     top_p: float
     text_normalize: str
+    rouge_tokenize: str
     save_per_run_jsonl: bool
     continue_on_error: bool
     device: str
@@ -136,6 +137,17 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "strip", "lower_strip", "squad"],
         default="strip",
         help="Text normalization mode before ROUGE-L.",
+    )
+    parser.add_argument(
+        "--rouge-tokenize",
+        type=str,
+        choices=["whitespace", "zh_char", "auto"],
+        default="auto",
+        help=(
+            "Tokenization mode for ROUGE-L. "
+            "'whitespace' uses split(), 'zh_char' uses CJK char + English word tokens, "
+            "'auto' uses zh_char only when CJK is detected."
+        ),
     )
     parser.add_argument(
         "--em-normalize",
@@ -252,9 +264,34 @@ def normalize_for_metric(text: str, mode: str) -> str:
     raise ValueError(f"Unknown normalization mode: {mode}")
 
 
-def rouge_l_f1(pred: str, gold: str) -> float:
-    pred_tokens = pred.split()
-    gold_tokens = gold.split()
+_CJK_CHAR_RE = re.compile(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
+_ZH_CHAR_WORD_TOKEN_RE = re.compile(
+    r"[A-Za-z0-9_]+|[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]|[^\s]",
+)
+
+
+def contains_cjk(text: str) -> bool:
+    return _CJK_CHAR_RE.search(text) is not None
+
+
+def tokenize_for_rouge(text: str, mode: str) -> list[str]:
+    text = text.strip()
+    if not text:
+        return []
+    if mode == "whitespace":
+        return text.split()
+    if mode == "zh_char":
+        return _ZH_CHAR_WORD_TOKEN_RE.findall(text)
+    if mode == "auto":
+        if contains_cjk(text):
+            return _ZH_CHAR_WORD_TOKEN_RE.findall(text)
+        return text.split()
+    raise ValueError(f"Unknown rouge tokenize mode: {mode}")
+
+
+def rouge_l_f1(pred: str, gold: str, tokenize_mode: str = "auto") -> float:
+    pred_tokens = tokenize_for_rouge(pred, tokenize_mode)
+    gold_tokens = tokenize_for_rouge(gold, tokenize_mode)
     if not pred_tokens or not gold_tokens:
         return 0.0
 
@@ -489,7 +526,7 @@ def evaluate_run(
         gold = item["gold"]
         norm_pred = normalize_for_metric(pred, cfg.text_normalize)
         norm_gold = normalize_for_metric(gold, cfg.text_normalize)
-        rouge = rouge_l_f1(norm_pred, norm_gold)
+        rouge = rouge_l_f1(norm_pred, norm_gold, tokenize_mode=cfg.rouge_tokenize)
         rouge_sum += rouge
         details.append(
             {
@@ -517,6 +554,7 @@ def evaluate_run(
         "rouge_l_f1_sum": rouge_sum,
         "rouge_l_f1": rouge_avg,
         "rouge_l_f1_percent": rouge_avg * 100.0,
+        "rouge_tokenize": cfg.rouge_tokenize,
         "elapsed_sec": elapsed,
         "error": "",
     }
@@ -543,6 +581,7 @@ def save_summary_csv(rows: list[dict[str, Any]], out_csv: Path) -> None:
         "rouge_l_f1_sum",
         "rouge_l_f1",
         "rouge_l_f1_percent",
+        "rouge_tokenize",
         "elapsed_sec",
         "error",
     ]
@@ -583,6 +622,7 @@ def main() -> None:
         temperature=max(1e-5, float(args.temperature)),
         top_p=max(1e-5, min(1.0, float(args.top_p))),
         text_normalize=args.text_normalize,
+        rouge_tokenize=args.rouge_tokenize,
         save_per_run_jsonl=bool(args.save_per_run_jsonl),
         continue_on_error=bool(args.continue_on_error),
         device=args.device,
@@ -637,7 +677,13 @@ def main() -> None:
 
     device = resolve_device(cfg.device)
     logging.info("Evaluation device: %s", device)
-    logging.info("Runs=%d | eval_items=%d | normalize=%s", len(cfg.runs), len(eval_items), cfg.text_normalize)
+    logging.info(
+        "Runs=%d | eval_items=%d | normalize=%s | rouge_tokenize=%s",
+        len(cfg.runs),
+        len(eval_items),
+        cfg.text_normalize,
+        cfg.rouge_tokenize,
+    )
 
     summaries: list[dict[str, Any]] = []
     for run in cfg.runs:
@@ -669,6 +715,7 @@ def main() -> None:
                     "rouge_l_f1_sum": "",
                     "rouge_l_f1": "",
                     "rouge_l_f1_percent": "",
+                    "rouge_tokenize": cfg.rouge_tokenize,
                     "elapsed_sec": "",
                     "error": str(exc),
                 }

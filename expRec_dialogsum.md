@@ -117,9 +117,9 @@ python3 /home/walkiiiy/DataRecipe/src/4.2/alpagasus/alpagasus_origin_sample.py \
 
 #  alpagasus_improved：保持原评分逻辑 + 映射到能力维向量
 python3 src/4.2/alpagasus/alpagasus_improved.py \
-  --data_path data/banking77/train.jsonl \
-  --routing_path data/banking77/train_coarse_topk5.jsonl \
-  --output_path data/banking77/score/alpagasus_improved_mapped.jsonl \
+  --data_path data/dialogsum/train.jsonl \
+  --routing_path data/dialogsum/train_coarse_topk5.jsonl \
+  --output_path data/dialogsum/score/alpagasus_improved_mapped.jsonl \
   --model deepseek-chat \
   --base_url https://api.deepseek.com \
   --temperature 0.01 \
@@ -127,6 +127,12 @@ python3 src/4.2/alpagasus/alpagasus_improved.py \
   --routing_weight_mode coarse \
   --concurrency 16
 
+
+python3 /home/walkiiiy/DataRecipe/src/4.2/alpagasus/alpagasus_improved_sample.py \
+  --score_path /home/walkiiiy/DataRecipe/data/dialogsum/score/alpagasus_improved_mapped.jsonl \
+  --data_path /home/walkiiiy/DataRecipe/data/dialogsum/train.jsonl \
+  --output_path /home/walkiiiy/DataRecipe/data/dialogsum/exp4.2/dataset_alpagasus_improved_140.jsonl \
+  --num_samples 140
 
 ================================================================================
 # instag
@@ -139,40 +145,38 @@ python3 src/4.2/instag/instag.py \
 
 采样
 python3 src/4.2/instag/instag_sample.py \
-  --data_path data/banking77/train.jsonl \
-  --tag_path data/banking77/score/instag_tags.jsonl \
-  --output_path data/banking77/exp4.2/dataset_instag.jsonl \
+  --data_path data/dialogsum/train.jsonl \
+  --tag_path data/dialogsum/score/instag_tags.jsonl \
+  --output_path data/dialogsum/exp4.2/dataset_instag_1000.jsonl \
   --num_samples 1000
 =======================================================
 # MIG
 - python3 src/4.2/mig/mig.py \
-  --data_path data/banking77/train.jsonl \
-  --instag_path data/banking77/score/instag_tags.jsonl \
-  --delta_path data/banking77/score/delta_origin_mapped.jsonl \
-  --output_path data/banking77/score/mig_scored.jsonl \
-  --cluster_output_path data/banking77/score/mig_tag_clusters.json \
-  --valid_tag_output_path data/banking77/score/mig_valid_tags.json \
+  --data_path data/dialogsum/train.jsonl \
+  --instag_path data/dialogsum/score/instag_tags.jsonl \
+  --delta_path data/dialogsum/score/delta_origin_mapped.jsonl \
+  --output_path data/dialogsum/score/mig_scored.jsonl \
+  --cluster_output_path data/dialogsum/score/mig_tag_clusters.json \
+  --valid_tag_output_path data/dialogsum/score/mig_valid_tags.json \
   --tag_merge_eps 0.05 \
   --delta_scalar_mode auto \
   --embedding_backend auto
 
 采样
 - python3 src/4.2/mig/mig_sample.py \
-  --scored_path data/banking77/score/mig_scored.jsonl \
-  --output_path data/banking77/exp4.2/dataset_mig.jsonl \
-  --num_samples 1000 \
-  --meta_output_path data/banking77/score/mig_sample_meta.json \
-  --embedding_backend auto
+  --scored_path data/dialogsum/score/mig_scored.jsonl \
+  --output_path data/dialogsum/exp4.2/dataset_mig_700.jsonl \
+  --num_samples 700 
 
 
 
 
 ============================================================================
 
-- datawhisperer
+# datawhisperer
 python3 src/4.2/datawhisperer/datawhisperer.py \
-  --data_path data/banking77/train.jsonl \
-  --output_path data/banking77/score/datawhisperer_icl_mapped.jsonl \
+  --data_path data/dialogsum/train.jsonl \
+  --output_path data/dialogsum/score/datawhisperer_icl_mapped.jsonl \
   --model_name_or_path ~/.cache/modelscope/hub/models/Qwen/Qwen2.5-0.5B-Instruct \
   --n_demonstrations 10 \
   --n_queries 5 \
@@ -183,6 +187,32 @@ python3 src/4.2/datawhisperer/datawhisperer.py \
   --max_new_tokens 16 \
   --max_input_tokens 2048 \
   --select_top_k 1000
+
+
+==============================================================
+# PDM
+python src/4.2/PDM/pdm.py \
+  --data_path data/dialogsum/train.jsonl \
+  --srm_path data/dialogsum/score/srm_from_topk5_only.jsonl \
+  --output_path data/dialogsum/score/pdm_scored.jsonl \
+  --model_name_or_path ~/.cache/modelscope/hub/models/Qwen/Qwen2.5-0.5B \
+  --context_size 4 \
+  --global_trials 3 \
+  --max_seq_len 1024 \
+  --nll_batch_size 8 \
+  --no-cache_token_ids \
+  --device_map auto
+
+
+python src/4.2/PDM/pdm_sample.py \
+  --score_path data/dialogsum/score/pdm_scored.jsonl \
+  --data_path data/dialogsum/train.jsonl \
+  --output_path data/dialogsum/exp4.2/dataset_pdm_1000.jsonl \
+  --num_samples 1000 \
+  --annotate_selection
+
+
+
 
 
 ===============================================================================================

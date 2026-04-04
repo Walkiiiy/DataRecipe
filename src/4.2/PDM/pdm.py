@@ -43,6 +43,11 @@ except Exception:  # noqa: BLE001
 
 logger = logging.getLogger(__name__)
 
+PROMPT_HEADER = (
+    "You are a helpful assistant. Learn from demonstrations and output the correct answer.\n"
+    "Only produce the final output text.\n\n"
+)
+
 
 def choose_row_id(row: Dict[str, Any], fallback_idx: int) -> Any:
     for key in ("id", "data_id", "uid", "idx", "index"):
@@ -197,6 +202,37 @@ def format_instruction_input(row: Dict[str, Any]) -> Tuple[str, str]:
         text = str(row.get("text", "") or "").strip()
         return text, ""
     return instruction, input_text
+
+
+def format_demo_tail(instruction: str, input_text: str, answer: str) -> str:
+    parts = [f"Instruction: {instruction}\n"]
+    if input_text:
+        parts.append(f"Input: {input_text}\n")
+    parts.append(f"Output: {answer}\n\n")
+    return "".join(parts)
+
+
+def format_query_prefix_text(instruction: str, input_text: str) -> str:
+    parts = ["### Query\n", f"Instruction: {instruction}\n"]
+    if input_text:
+        parts.append(f"Input: {input_text}\n")
+    parts.append("Output:")
+    return "".join(parts)
+
+
+def precompute_text_cache(
+    rows: List[Dict[str, Any]],
+) -> Tuple[List[str], List[str], List[str]]:
+    demo_tails: List[str] = []
+    query_prefixes: List[str] = []
+    targets: List[str] = []
+    for row in rows:
+        instruction, input_text = format_instruction_input(row)
+        answer = extract_target_text(row)
+        demo_tails.append(format_demo_tail(instruction, input_text, answer))
+        query_prefixes.append(format_query_prefix_text(instruction, input_text))
+        targets.append(answer)
+    return demo_tails, query_prefixes, targets
 
 
 @dataclass(frozen=True)
@@ -366,6 +402,46 @@ def load_model_and_tokenizer(
     return model, tokenizer
 
 
+def auto_adjust_nll_batch_size(scorer: "PDMScorer", requested_batch_size: int) -> int:
+    if torch is None:
+        return max(1, int(requested_batch_size))
+    req = max(1, int(requested_batch_size))
+    try:
+        dev = scorer._device()
+    except Exception:  # noqa: BLE001
+        return req
+    if str(getattr(dev, "type", "")).lower() != "cuda":
+        return req
+
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(dev)
+    except Exception:  # noqa: BLE001
+        return req
+
+    try:
+        vocab_size = int(getattr(scorer.model.config, "vocab_size", 0))
+    except Exception:  # noqa: BLE001
+        vocab_size = 0
+    if vocab_size <= 0:
+        vocab_size = int(getattr(scorer.tokenizer, "vocab_size", 0) or 0)
+    if vocab_size <= 0:
+        return req
+
+    try:
+        param_dtype = next(scorer.model.parameters()).dtype
+        dtype_bytes = int(torch.tensor([], dtype=param_dtype).element_size())
+    except Exception:  # noqa: BLE001
+        dtype_bytes = 2
+
+    # Approximate per-sample logits memory: [T-1, V] * dtype_bytes.
+    # Keep conservative headroom because CE and activations need extra memory.
+    seq = max(2, int(scorer.max_seq_len))
+    per_sample_bytes = max(1, (seq - 1) * vocab_size * max(1, dtype_bytes))
+    headroom_ratio = 0.35
+    safe = int((float(free_bytes) * headroom_ratio) // float(per_sample_bytes))
+    return max(1, min(req, safe if safe > 0 else 1))
+
+
 class PDMScorer:
     def __init__(
         self,
@@ -382,6 +458,8 @@ class PDMScorer:
         if pad_id is None:
             pad_id = 0
         self.pad_id = int(pad_id)
+        self._prompt_header_ids: Optional[List[int]] = None
+        self._demo_header_ids: Dict[int, List[int]] = {}
 
     def _device(self) -> Any:
         try:
@@ -394,36 +472,70 @@ class PDMScorer:
     def _format_demo_block(self, row: Dict[str, Any], idx: int) -> str:
         instruction, input_text = format_instruction_input(row)
         answer = extract_target_text(row)
-        out = [f"### Demonstration {idx}\n"]
-        out.append(f"Instruction: {instruction}\n")
-        if input_text:
-            out.append(f"Input: {input_text}\n")
-        out.append(f"Output: {answer}\n\n")
-        return "".join(out)
+        return f"### Demonstration {idx}\n" + format_demo_tail(instruction, input_text, answer)
 
     def _format_query_prefix(self, row: Dict[str, Any]) -> str:
         instruction, input_text = format_instruction_input(row)
-        out = ["### Query\n"]
-        out.append(f"Instruction: {instruction}\n")
-        if input_text:
-            out.append(f"Input: {input_text}\n")
-        out.append("Output:")
-        return "".join(out)
+        return format_query_prefix_text(instruction, input_text)
 
     def _build_prefix(self, query_row: Dict[str, Any], context_rows: List[Dict[str, Any]]) -> str:
-        header = (
-            "You are a helpful assistant. Learn from demonstrations and output the correct answer.\n"
-            "Only produce the final output text.\n\n"
-        )
-        chunks = [header]
+        chunks = [PROMPT_HEADER]
         for i, row in enumerate(context_rows, start=1):
             chunks.append(self._format_demo_block(row, i))
         chunks.append(self._format_query_prefix(query_row))
         return "".join(chunks)
 
-    def _encode_for_loss(self, prefix: str, target: str) -> Tuple[List[int], List[int]]:
-        prefix_ids = self.tokenizer.encode(prefix, add_special_tokens=False)
-        target_ids = self.tokenizer.encode(target, add_special_tokens=False)
+    def build_prefix_from_cache(
+        self,
+        query_prefix: str,
+        context_indices: List[int],
+        demo_tails: List[str],
+    ) -> str:
+        chunks = [PROMPT_HEADER]
+        for i, row_idx in enumerate(context_indices, start=1):
+            chunks.append(f"### Demonstration {i}\n")
+            chunks.append(demo_tails[row_idx])
+        chunks.append(query_prefix)
+        return "".join(chunks)
+
+    def encode_text(self, text: str) -> List[int]:
+        return [int(x) for x in self.tokenizer.encode(text, add_special_tokens=False)]
+
+    def prompt_header_ids(self) -> List[int]:
+        if self._prompt_header_ids is None:
+            self._prompt_header_ids = self.encode_text(PROMPT_HEADER)
+        return self._prompt_header_ids
+
+    def demo_header_ids(self, demo_rank: int) -> List[int]:
+        out = self._demo_header_ids.get(int(demo_rank))
+        if out is not None:
+            return out
+        out = self.encode_text(f"### Demonstration {int(demo_rank)}\n")
+        self._demo_header_ids[int(demo_rank)] = out
+        return out
+
+    def build_prefix_ids_from_token_cache(
+        self,
+        query_prefix_ids: List[int],
+        context_indices: List[int],
+        demo_tail_ids_cache: Dict[int, List[int]],
+        demo_tails: List[str],
+    ) -> List[int]:
+        out: List[int] = []
+        out.extend(self.prompt_header_ids())
+        for i, row_idx in enumerate(context_indices, start=1):
+            out.extend(self.demo_header_ids(i))
+            tail_ids = demo_tail_ids_cache.get(int(row_idx))
+            if tail_ids is None:
+                tail_ids = self.encode_text(demo_tails[int(row_idx)])
+                demo_tail_ids_cache[int(row_idx)] = tail_ids
+            out.extend(tail_ids)
+        out.extend(query_prefix_ids)
+        return out
+
+    def _encode_for_loss_ids(self, prefix_ids: List[int], target_ids: List[int]) -> Tuple[List[int], List[int]]:
+        prefix_ids = [int(x) for x in prefix_ids]
+        target_ids = [int(x) for x in target_ids]
 
         if not target_ids:
             eos_id = self.tokenizer.eos_token_id
@@ -445,6 +557,11 @@ class PDMScorer:
         input_ids = prefix_ids + target_ids
         labels = ([-100] * len(prefix_ids)) + target_ids
         return input_ids, labels
+
+    def _encode_for_loss(self, prefix: str, target: str) -> Tuple[List[int], List[int]]:
+        prefix_ids = self.encode_text(prefix)
+        target_ids = self.encode_text(target)
+        return self._encode_for_loss_ids(prefix_ids=prefix_ids, target_ids=target_ids)
 
     def _batch_nll(self, encoded_batch: List[Tuple[List[int], List[int]]]) -> List[float]:
         if torch is None or F is None:
@@ -470,7 +587,7 @@ class PDMScorer:
             labels[i, :n] = torch.tensor(lbs, dtype=torch.long, device=dev)
             attn[i, :n] = 1
 
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self.model(input_ids=input_ids, attention_mask=attn, use_cache=False, return_dict=True)
 
         logits = outputs.logits  # [B, T, V]
@@ -561,6 +678,31 @@ def sample_context_indices(
     return selected
 
 
+def sample_global_context_indices(
+    global_candidates: List[int],
+    exclude_index: int,
+    k: int,
+    rng: random.Random,
+) -> List[int]:
+    if k <= 0:
+        return []
+    n = len(global_candidates)
+    if n <= 1:
+        return []
+    if k >= n:
+        return [x for x in global_candidates if x != exclude_index][:k]
+
+    # Here global_candidates is constructed as list(range(N)).
+    # Sample from [0, N-2] then shift around exclude to avoid O(N) filtering.
+    picks = rng.sample(range(n - 1), k)
+    out: List[int] = []
+    ex = int(exclude_index)
+    for p in picks:
+        idx = int(p if p < ex else p + 1)
+        out.append(int(global_candidates[idx]))
+    return out
+
+
 def infer_m_from_srm_map(srm_map: Dict[str, SrmItem]) -> int:
     max_idx = -1
     for item in srm_map.values():
@@ -600,6 +742,12 @@ def parse_args() -> argparse.Namespace:
         help="Transformers device_map; use 'none' to disable.",
     )
     parser.add_argument("--max_seq_len", type=int, default=2048, help="Max sequence length for loss computation.")
+    parser.add_argument(
+        "--nll_batch_size",
+        type=int,
+        default=32,
+        help="Batch size for NLL forward passes across contexts (higher = faster, more VRAM).",
+    )
 
     parser.add_argument("--global_trials", type=int, default=3, help="Number of global random baseline trials.")
     parser.add_argument("--context_size", type=int, default=4, help="Context sample count per trial.")
@@ -621,6 +769,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--starting_sample", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=-1)
+    parser.add_argument(
+        "--cache_text",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Precompute demo/query text cache for faster prompt building.",
+    )
+    parser.add_argument(
+        "--cache_token_ids",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Cache tokenized query/target/demo pieces to reduce repeated tokenizer.encode calls.",
+    )
 
     parser.add_argument(
         "--attach_routing_meta",
@@ -705,6 +865,16 @@ def main() -> None:
 
     scorer: Optional[PDMScorer] = None
     if not args.dry_run:
+        if torch is not None and torch.cuda.is_available():
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:  # noqa: BLE001
+                pass
         model, tokenizer = load_model_and_tokenizer(
             model_name_or_path=args.model_name_or_path,
             torch_dtype=args.torch_dtype,
@@ -718,12 +888,48 @@ def main() -> None:
     else:
         logger.info("Dry run enabled: using SRM scores as proxy signals for PDM.")
 
+    demo_tails: List[str] = []
+    query_prefixes: List[str] = []
+    targets: List[str] = []
+    if bool(args.cache_text):
+        logger.info("Precomputing text cache for %d rows", len(data_rows))
+        demo_tails, query_prefixes, targets = precompute_text_cache(data_rows)
+
     intermediates: List[Dict[str, Any]] = []
     deviations_by_dim: Dict[int, List[float]] = {}
 
     iterator = enumerate(work_rows)
     if tqdm is not None:
         iterator = tqdm(iterator, total=len(work_rows), desc="PDM pass-1")  # type: ignore[assignment]
+
+    pending_encoded: List[Tuple[List[int], List[int]]] = []
+    pending_meta: List[Tuple[int, int]] = []
+    nll_batch_size = max(1, int(args.nll_batch_size))
+    if scorer is not None:
+        adjusted_bsz = auto_adjust_nll_batch_size(scorer, nll_batch_size)
+        if adjusted_bsz < nll_batch_size:
+            logger.warning(
+                "Adjusted --nll_batch_size from %d to %d for available CUDA memory.",
+                nll_batch_size,
+                adjusted_bsz,
+            )
+        nll_batch_size = adjusted_bsz
+    use_token_cache = bool(args.cache_text) and bool(args.cache_token_ids) and (not args.dry_run)
+    demo_tail_ids_cache: Dict[int, List[int]] = {}
+    query_prefix_ids_cache: Dict[int, List[int]] = {}
+    target_ids_cache: Dict[int, List[int]] = {}
+    if use_token_cache:
+        logger.info("Token-id cache enabled for query/target/demo text pieces.")
+
+    def flush_pending() -> None:
+        if not pending_encoded:
+            return
+        assert scorer is not None
+        losses = scorer._batch_nll(pending_encoded)
+        for (sample_idx, meta_idx), loss in zip(pending_meta, losses):
+            intermediates[sample_idx]["context_losses"][meta_idx] = float(loss)
+        pending_encoded.clear()
+        pending_meta.clear()
 
     for local_idx, row in iterator:
         global_idx = start + local_idx
@@ -748,59 +954,34 @@ def main() -> None:
         baseline_loss = 0.0
         cond_losses: Dict[int, float] = {}
         deviations: Dict[int, float] = {}
+        context_meta: List[Tuple[str, int]] = []
+        context_indices_list: List[List[int]] = []
 
-        if active_indices:
-            if args.dry_run:
-                baseline_loss = 1.0
-                for dim in active_indices:
-                    proxy = float(score_by_dim.get(dim, 0.0))
-                    cond = max(0.0, 1.0 - proxy)
-                    cond_losses[dim] = cond
-                    dev = baseline_loss - cond
-                    deviations[dim] = dev
-                    deviations_by_dim.setdefault(dim, []).append(dev)
-            else:
-                assert scorer is not None
-                context_batches: List[List[Dict[str, Any]]] = []
-                context_meta: List[Tuple[str, int]] = []
+        if active_indices and not args.dry_run:
+            g_trials = max(1, int(args.global_trials))
+            ctx_size = max(1, int(args.context_size))
 
-                g_trials = max(1, int(args.global_trials))
-                ctx_size = max(1, int(args.context_size))
+            for _ in range(g_trials):
+                idxs = sample_global_context_indices(
+                    global_candidates=global_indices,
+                    exclude_index=global_idx,
+                    k=ctx_size,
+                    rng=rng,
+                )
+                context_indices_list.append(idxs)
+                context_meta.append(("global", -1))
 
-                for _ in range(g_trials):
-                    idxs = sample_context_indices(
-                        primary_candidates=global_indices,
-                        global_candidates=global_indices,
-                        exclude_index=global_idx,
-                        k=ctx_size,
-                        rng=rng,
-                    )
-                    context_batches.append([data_rows[i] for i in idxs])
-                    context_meta.append(("global", -1))
-
-                for dim in active_indices:
-                    pool = cluster_pools.get(int(dim), [])
-                    idxs = sample_context_indices(
-                        primary_candidates=pool,
-                        global_candidates=global_indices,
-                        exclude_index=global_idx,
-                        k=ctx_size,
-                        rng=rng,
-                    )
-                    context_batches.append([data_rows[i] for i in idxs])
-                    context_meta.append(("cluster", int(dim)))
-
-                losses = scorer.compute_losses(query_row=row, context_rows_batch=context_batches)
-                base_losses = [loss for (kind, _d), loss in zip(context_meta, losses) if kind == "global"]
-                baseline_loss = mean(base_losses)
-
-                for (kind, dim), loss in zip(context_meta, losses):
-                    if kind != "cluster" or dim < 0:
-                        continue
-                    cond_losses[int(dim)] = float(loss)
-                    dev = float(baseline_loss - loss)
-                    deviations[int(dim)] = dev
-                    deviations_by_dim.setdefault(int(dim), []).append(dev)
+            for dim in active_indices:
+                pool = cluster_pools.get(int(dim), [])
+                idxs = sample_context_indices(
+                    primary_candidates=pool,
+                    global_candidates=global_indices,
+                    exclude_index=global_idx,
+                    k=ctx_size,
+                    rng=rng,
+                )
+                context_indices_list.append(idxs)
+                context_meta.append(("cluster", int(dim)))
 
         intermediates.append(
             {
@@ -815,8 +996,109 @@ def main() -> None:
                 "top_k_node_ids": top_k_node_ids,
                 "top_k_node_names": top_k_node_names,
                 "top_k_node_paths": top_k_node_paths,
+                "context_meta": context_meta,
+                "context_losses": [None] * len(context_meta),
             }
         )
+
+        if not active_indices:
+            continue
+
+        if args.dry_run:
+            baseline_loss = 1.0
+            for dim in active_indices:
+                proxy = float(score_by_dim.get(dim, 0.0))
+                cond = max(0.0, 1.0 - proxy)
+                cond_losses[dim] = cond
+                dev = baseline_loss - cond
+                deviations[dim] = dev
+                deviations_by_dim.setdefault(dim, []).append(dev)
+            intermediates[local_idx]["baseline_loss"] = baseline_loss
+            intermediates[local_idx]["cond_losses"] = cond_losses
+            intermediates[local_idx]["deviations"] = deviations
+            continue
+
+        if not context_meta:
+            continue
+
+        query_prefix_ids: List[int] = []
+        target_ids: List[int] = []
+        if bool(args.cache_text):
+            query_prefix = query_prefixes[global_idx]
+            target = targets[global_idx]
+            if use_token_cache:
+                assert scorer is not None
+                qids = query_prefix_ids_cache.get(global_idx)
+                if qids is None:
+                    qids = scorer.encode_text(query_prefix)
+                    query_prefix_ids_cache[global_idx] = qids
+                tids = target_ids_cache.get(global_idx)
+                if tids is None:
+                    tids = scorer.encode_text(target) if target else []
+                    target_ids_cache[global_idx] = tids
+                query_prefix_ids = qids
+                target_ids = tids
+        else:
+            query_prefix = scorer._format_query_prefix(row) if scorer is not None else ""
+            target = extract_target_text(row)
+
+        if not target:
+            for i in range(len(context_meta)):
+                intermediates[local_idx]["context_losses"][i] = 0.0
+            continue
+
+        for meta_idx, idxs in enumerate(context_indices_list):
+            if use_token_cache:
+                assert scorer is not None
+                prefix_ids = scorer.build_prefix_ids_from_token_cache(
+                    query_prefix_ids=query_prefix_ids,
+                    context_indices=idxs,
+                    demo_tail_ids_cache=demo_tail_ids_cache,
+                    demo_tails=demo_tails,
+                )
+                encoded = scorer._encode_for_loss_ids(prefix_ids=prefix_ids, target_ids=target_ids)
+            elif bool(args.cache_text):
+                prefix = scorer.build_prefix_from_cache(query_prefix, idxs, demo_tails)
+                encoded = scorer._encode_for_loss(prefix=prefix, target=target)
+            else:
+                context_rows = [data_rows[i] for i in idxs]
+                prefix = scorer._build_prefix(row, context_rows)
+                encoded = scorer._encode_for_loss(prefix=prefix, target=target)
+            pending_encoded.append(encoded)
+            pending_meta.append((local_idx, meta_idx))
+            if len(pending_encoded) >= nll_batch_size:
+                flush_pending()
+
+    if not args.dry_run:
+        flush_pending()
+
+        for meta in intermediates:
+            context_meta = meta.get("context_meta", [])
+            context_losses = meta.get("context_losses", [])
+            if not meta.get("active_indices"):
+                meta.pop("context_meta", None)
+                meta.pop("context_losses", None)
+                continue
+            if context_meta and any(loss is None for loss in context_losses):
+                raise RuntimeError("Missing losses in batched NLL computation; try smaller --nll_batch_size.")
+
+            base_losses = [loss for (kind, _d), loss in zip(context_meta, context_losses) if kind == "global"]
+            baseline_loss = mean([float(x) for x in base_losses if x is not None])
+            cond_losses = {}
+            deviations = {}
+            for (kind, dim), loss in zip(context_meta, context_losses):
+                if kind != "cluster" or dim < 0 or loss is None:
+                    continue
+                cond_losses[int(dim)] = float(loss)
+                dev = float(baseline_loss - float(loss))
+                deviations[int(dim)] = dev
+                deviations_by_dim.setdefault(int(dim), []).append(dev)
+
+            meta["baseline_loss"] = float(baseline_loss)
+            meta["cond_losses"] = cond_losses
+            meta["deviations"] = deviations
+            meta.pop("context_meta", None)
+            meta.pop("context_losses", None)
 
     dim_mean: Dict[int, float] = {}
     dim_std: Dict[int, float] = {}
@@ -896,4 +1178,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

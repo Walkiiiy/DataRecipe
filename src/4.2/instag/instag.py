@@ -13,12 +13,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from urllib3.util import Timeout as Urllib3Timeout
 
 try:
     from tqdm import tqdm
@@ -41,12 +43,14 @@ class InStagTagger:
         model: str = "deepseek-chat",
         base_url: str = "https://api.deepseek.com",
         request_timeout: int = 120,
+        connect_timeout: float = 10.0,
         max_retries: int = 3,
         retry_sleep: float = 2.0,
     ) -> None:
         self.api_key = api_key
         self.model = model
         self.request_timeout = int(request_timeout)
+        self.connect_timeout = max(0.1, float(connect_timeout))
         self.max_retries = int(max_retries)
         self.retry_sleep = float(retry_sleep)
         self.endpoint = self._normalize_endpoint(base_url)
@@ -187,6 +191,29 @@ Your response have to strictly follow this JSON format: [{{"tag": str, "explanat
 
         return tags, tag_details
 
+    def _build_http_timeout(self) -> Urllib3Timeout:
+        total_timeout = max(1.0, float(self.request_timeout))
+        connect_timeout = min(self.connect_timeout, total_timeout)
+        return Urllib3Timeout(total=total_timeout, connect=connect_timeout, read=total_timeout)
+
+    def _compute_retry_delay(self, attempt: int, retry_after: Optional[str]) -> float:
+        base = max(0.0, self.retry_sleep * attempt)
+        jitter = random.uniform(0.0, max(0.1, self.retry_sleep))
+        delay = base + jitter
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except ValueError:
+                pass
+        return delay
+
+    @staticmethod
+    def _short_error_text(text: str, max_len: int = 240) -> str:
+        clean = str(text or "").replace("\n", " ").replace("\r", " ").strip()
+        if len(clean) <= max_len:
+            return clean
+        return clean[:max_len].rstrip() + "..."
+
     def _call_deepseek_text(self, prompt: str, temperature: float, max_tokens: int) -> str:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -214,18 +241,31 @@ Your response have to strictly follow this JSON format: [{{"tag": str, "explanat
                     self.endpoint,
                     headers=headers,
                     json=payload,
-                    timeout=self.request_timeout,
+                    timeout=self._build_http_timeout(),
                 )
 
                 if resp.status_code == 400 and use_response_format and "response_format" in resp.text.lower():
                     use_response_format = False
                     continue
 
-                if resp.status_code >= 500 or resp.status_code == 429:
-                    raise requests.HTTPError(
-                        f"DeepSeek temporary error {resp.status_code}: {resp.text}",
-                        response=resp,
+                if resp.status_code >= 500 or resp.status_code in (408, 429):
+                    status = resp.status_code
+                    body = self._short_error_text(resp.text)
+                    retry_after = resp.headers.get("Retry-After")
+                    if attempt == self.max_retries:
+                        raise RuntimeError(
+                            f"DeepSeek temporary error {status} after retries: {body}"
+                        )
+                    sleep_s = self._compute_retry_delay(attempt, retry_after)
+                    logger.warning(
+                        "DeepSeek temporary status=%s at attempt=%d/%d, sleeping %.1fs then retry.",
+                        status,
+                        attempt,
+                        self.max_retries,
+                        sleep_s,
                     )
+                    time.sleep(sleep_s)
+                    continue
 
                 resp.raise_for_status()
                 data = resp.json()
@@ -234,10 +274,31 @@ Your response have to strictly follow this JSON format: [{{"tag": str, "explanat
                     return ""
                 return str(choices[0].get("message", {}).get("content", "")).strip()
 
+            except requests.Timeout as exc:
+                if attempt == self.max_retries:
+                    raise RuntimeError(
+                        f"DeepSeek request timeout after retries (timeout={self.request_timeout}s total): {exc}"
+                    ) from exc
+                sleep_s = self._compute_retry_delay(attempt, retry_after=None)
+                logger.warning(
+                    "DeepSeek timeout at attempt=%d/%d, sleeping %.1fs then retry.",
+                    attempt,
+                    self.max_retries,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
             except (requests.RequestException, ValueError, KeyError) as exc:
                 if attempt == self.max_retries:
                     raise RuntimeError(f"DeepSeek tag request failed after retries: {exc}") from exc
-                time.sleep(self.retry_sleep * attempt)
+                sleep_s = self._compute_retry_delay(attempt, retry_after=None)
+                logger.warning(
+                    "DeepSeek request error at attempt=%d/%d: %s; sleeping %.1fs then retry.",
+                    attempt,
+                    self.max_retries,
+                    self._short_error_text(str(exc)),
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
 
         return ""
 
@@ -277,6 +338,26 @@ Your response have to strictly follow this JSON format: [{{"tag": str, "explanat
             out["instag_raw_response"] = raw_response
         return out
 
+    def _build_error_row(
+        self,
+        sample: Dict[str, Any],
+        sample_index: int,
+        text_field: str,
+        error: Exception,
+    ) -> Dict[str, Any]:
+        sample_id = self._choose_row_id(sample, sample_index)
+        text = self._compose_text(sample, text_field=text_field)
+        return {
+            "id": sample_id,
+            "instag_index": int(sample_index),
+            "tags": [],
+            "labels": [],
+            "tags_with_explanations": [],
+            "text": text,
+            "score_type": "instag_tags",
+            "instag_error": self._short_error_text(str(error), max_len=500),
+        }
+
     def score_dataset(
         self,
         data: List[Dict[str, Any]],
@@ -288,6 +369,7 @@ Your response have to strictly follow this JSON format: [{{"tag": str, "explanat
         temperature: float,
         max_tokens: int,
         include_prompt: bool,
+        fail_fast: bool,
     ) -> Tuple[List[Dict[str, Any]], int, int]:
         total = len(data)
         start = max(0, int(starting_sample))
@@ -309,17 +391,35 @@ Your response have to strictly follow this JSON format: [{{"tag": str, "explanat
             iterator = tqdm(selected, total=len(selected), desc="InSTAG tagging") if tqdm else selected
             out: List[Dict[str, Any]] = []
             for local_idx, sample in enumerate(iterator):
-                out.append(
-                    self._score_one_sample(
-                        sample=sample,
-                        sample_index=start + local_idx,
-                        text_field=text_field,
-                        dry_run=dry_run,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        include_prompt=include_prompt,
+                global_idx = start + local_idx
+                try:
+                    out.append(
+                        self._score_one_sample(
+                            sample=sample,
+                            sample_index=global_idx,
+                            text_field=text_field,
+                            dry_run=dry_run,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            include_prompt=include_prompt,
+                        )
                     )
-                )
+                except Exception as exc:
+                    if fail_fast:
+                        raise
+                    logger.warning(
+                        "Sample idx=%d failed, writing empty tags and continuing: %s",
+                        global_idx,
+                        self._short_error_text(str(exc)),
+                    )
+                    out.append(
+                        self._build_error_row(
+                            sample=sample,
+                            sample_index=global_idx,
+                            text_field=text_field,
+                            error=exc,
+                        )
+                    )
             return out, start, end
 
         results: List[Optional[Dict[str, Any]]] = [None] * len(selected)
@@ -345,7 +445,23 @@ Your response have to strictly follow this JSON format: [{{"tag": str, "explanat
             try:
                 for future in as_completed(futures):
                     idx = futures[future]
-                    results[idx] = future.result()
+                    try:
+                        results[idx] = future.result()
+                    except Exception as exc:
+                        global_idx = start + idx
+                        if fail_fast:
+                            raise
+                        logger.warning(
+                            "Sample idx=%d failed, writing empty tags and continuing: %s",
+                            global_idx,
+                            self._short_error_text(str(exc)),
+                        )
+                        results[idx] = self._build_error_row(
+                            sample=selected[idx],
+                            sample_index=global_idx,
+                            text_field=text_field,
+                            error=exc,
+                        )
                     if progress:
                         progress.update(1)
             finally:
@@ -372,6 +488,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_tokens", type=int, default=256)
     parser.add_argument("--max_retries", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--connect_timeout", type=float, default=10.0)
     parser.add_argument("--retry_sleep", type=float, default=2.0)
     parser.add_argument("--starting_sample", type=int, default=0)
     parser.add_argument("--max_samples", type=int, default=-1)
@@ -383,6 +500,12 @@ def parse_args() -> argparse.Namespace:
         default=1,
     )
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--fail_fast",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true, stop immediately when any sample fails. Default is continue with empty tags.",
+    )
     parser.add_argument(
         "--include_prompt",
         action=argparse.BooleanOptionalAction,
@@ -402,6 +525,7 @@ def main() -> None:
         model=args.model,
         base_url=args.base_url,
         request_timeout=args.timeout,
+        connect_timeout=args.connect_timeout,
         max_retries=args.max_retries,
         retry_sleep=args.retry_sleep,
     )
@@ -421,6 +545,7 @@ def main() -> None:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         include_prompt=bool(args.include_prompt),
+        fail_fast=bool(args.fail_fast),
     )
 
     output_dir = os.path.dirname(args.output_path)

@@ -4,12 +4,14 @@ from dataclasses import dataclass
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from urllib3.util import Timeout as Urllib3Timeout
 
 try:
     from tqdm import tqdm
@@ -46,14 +48,16 @@ class DeepSeekAlpagasusVectorScorer:
         model: str = "deepseek-chat",
         base_url: str = "https://api.deepseek.com",
         request_timeout: int = 120,
+        connect_timeout: float = 10.0,
         max_retries: int = 3,
         retry_sleep: float = 2.0,
     ) -> None:
         self.api_key = api_key
         self.model = model
-        self.request_timeout = request_timeout
-        self.max_retries = max_retries
-        self.retry_sleep = retry_sleep
+        self.request_timeout = int(request_timeout)
+        self.connect_timeout = max(0.1, float(connect_timeout))
+        self.max_retries = int(max_retries)
+        self.retry_sleep = float(retry_sleep)
 
         self.endpoint = self._normalize_endpoint(base_url)
         self._thread_local = threading.local()
@@ -275,6 +279,29 @@ class DeepSeekAlpagasusVectorScorer:
         score = 1.0 if is_yes else 0.0
         return is_yes, score, second.strip()
 
+    def _build_http_timeout(self) -> Urllib3Timeout:
+        total_timeout = max(1.0, float(self.request_timeout))
+        connect_timeout = min(self.connect_timeout, total_timeout)
+        return Urllib3Timeout(total=total_timeout, connect=connect_timeout, read=total_timeout)
+
+    def _compute_retry_delay(self, attempt: int, retry_after: Optional[str]) -> float:
+        base = max(0.0, self.retry_sleep * attempt)
+        jitter = random.uniform(0.0, max(0.1, self.retry_sleep))
+        delay = base + jitter
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except ValueError:
+                pass
+        return delay
+
+    @staticmethod
+    def _short_error_text(text: str, max_len: int = 240) -> str:
+        clean = str(text or "").replace("\n", " ").replace("\r", " ").strip()
+        if len(clean) <= max_len:
+            return clean
+        return clean[:max_len].rstrip() + "..."
+
     def call_deepseek(
         self,
         prompt: str,
@@ -302,14 +329,27 @@ class DeepSeekAlpagasusVectorScorer:
                     self.endpoint,
                     headers=headers,
                     json=payload,
-                    timeout=self.request_timeout,
+                    timeout=self._build_http_timeout(),
                 )
 
-                if resp.status_code >= 500 or resp.status_code == 429:
-                    raise requests.HTTPError(
-                        f"DeepSeek temporary error {resp.status_code}: {resp.text}",
-                        response=resp,
+                if resp.status_code >= 500 or resp.status_code in (408, 429):
+                    status = resp.status_code
+                    body = self._short_error_text(resp.text)
+                    retry_after = resp.headers.get("Retry-After")
+                    if attempt == self.max_retries:
+                        raise RuntimeError(
+                            f"DeepSeek temporary error {status} after retries: {body}"
+                        )
+                    sleep_s = self._compute_retry_delay(attempt, retry_after)
+                    logger.warning(
+                        "DeepSeek temporary status=%s at attempt=%d/%d, sleeping %.1fs then retry.",
+                        status,
+                        attempt,
+                        self.max_retries,
+                        sleep_s,
                     )
+                    time.sleep(sleep_s)
+                    continue
 
                 resp.raise_for_status()
                 data = resp.json()
@@ -318,10 +358,31 @@ class DeepSeekAlpagasusVectorScorer:
                     return ""
                 return str(choices[0].get("message", {}).get("content", "")).strip()
 
+            except requests.Timeout as exc:
+                if attempt == self.max_retries:
+                    raise RuntimeError(
+                        f"DeepSeek request timeout after retries (timeout={self.request_timeout}s total): {exc}"
+                    ) from exc
+                sleep_s = self._compute_retry_delay(attempt, retry_after=None)
+                logger.warning(
+                    "DeepSeek timeout at attempt=%d/%d, sleeping %.1fs then retry.",
+                    attempt,
+                    self.max_retries,
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
             except (requests.RequestException, ValueError, KeyError) as exc:
                 if attempt == self.max_retries:
                     raise RuntimeError(f"DeepSeek API request failed after retries: {exc}") from exc
-                time.sleep(self.retry_sleep * attempt)
+                sleep_s = self._compute_retry_delay(attempt, retry_after=None)
+                logger.warning(
+                    "DeepSeek request error at attempt=%d/%d: %s; sleeping %.1fs then retry.",
+                    attempt,
+                    self.max_retries,
+                    self._short_error_text(str(exc)),
+                    sleep_s,
+                )
+                time.sleep(sleep_s)
 
         return ""
 
@@ -376,6 +437,55 @@ class DeepSeekAlpagasusVectorScorer:
 
         return item
 
+    def _build_error_row(
+        self,
+        sample: Dict[str, Any],
+        sample_index: int,
+        routing_map: Dict[str, RoutedItem],
+        m_dimensions: int,
+        routing_weight_mode: str,
+        attach_routing_meta: bool,
+        include_prompt: bool,
+        error: Exception,
+    ) -> Dict[str, Any]:
+        sample_id = self._choose_row_id(sample, sample_index)
+        routed_item = routing_map.get(str(sample_id))
+        if routed_item is None and str(sample_id) != str(sample_index):
+            routed_item = routing_map.get(str(sample_index))
+
+        item = dict(sample)
+        item["id"] = sample_id
+        item["judge_model"] = self.model
+        item["judge_response"] = ""
+        item["judge_pass"] = False
+        item["judge_score"] = 0.0
+        item["judge_reason"] = ""
+        item["judge_index"] = int(sample_index)
+        item["alpagasus_scalar"] = 0.0
+        item["mapped_vector"] = [0.0] * m_dimensions
+        item["score"] = item["mapped_vector"]
+        item["score_type"] = "alpagasus_mapped_vector"
+        item["routing_weight_mode"] = routing_weight_mode
+        item["judge_error"] = self._short_error_text(str(error), max_len=500)
+        if include_prompt:
+            item["judge_prompt"] = self.generate_prompt(sample)
+
+        if attach_routing_meta:
+            if routed_item is None:
+                item["top_k_indices"] = []
+                item["top_k_scores"] = []
+                item["top_k_node_ids"] = []
+                item["top_k_node_names"] = []
+                item["top_k_node_paths"] = []
+            else:
+                item["top_k_indices"] = routed_item.top_k_indices
+                item["top_k_scores"] = routed_item.top_k_scores
+                item["top_k_node_ids"] = routed_item.top_k_node_ids
+                item["top_k_node_names"] = routed_item.top_k_node_names
+                item["top_k_node_paths"] = routed_item.top_k_node_paths
+
+        return item
+
     def score_dataset(
         self,
         data: List[Dict[str, Any]],
@@ -390,6 +500,7 @@ class DeepSeekAlpagasusVectorScorer:
         max_tokens: int,
         attach_routing_meta: bool,
         include_prompt: bool,
+        fail_fast: bool,
     ) -> Tuple[List[Dict[str, Any]], int, int]:
         total = len(data)
         start = max(0, int(starting_sample))
@@ -412,22 +523,43 @@ class DeepSeekAlpagasusVectorScorer:
             out: List[Dict[str, Any]] = []
             for local_idx, sample in enumerate(iterator):
                 global_idx = start + local_idx
-                sample_id, routed_item = self._resolve_sample_routing(sample, global_idx, routing_map)
-                out.append(
-                    self._score_one_sample(
-                        sample=sample,
-                        sample_index=global_idx,
-                        sample_id=sample_id,
-                        routed_item=routed_item,
-                        m_dimensions=m_dimensions,
-                        routing_weight_mode=routing_weight_mode,
-                        dry_run=dry_run,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        attach_routing_meta=attach_routing_meta,
-                        include_prompt=include_prompt,
+                try:
+                    sample_id, routed_item = self._resolve_sample_routing(sample, global_idx, routing_map)
+                    out.append(
+                        self._score_one_sample(
+                            sample=sample,
+                            sample_index=global_idx,
+                            sample_id=sample_id,
+                            routed_item=routed_item,
+                            m_dimensions=m_dimensions,
+                            routing_weight_mode=routing_weight_mode,
+                            dry_run=dry_run,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            attach_routing_meta=attach_routing_meta,
+                            include_prompt=include_prompt,
+                        )
                     )
-                )
+                except Exception as exc:
+                    if fail_fast:
+                        raise
+                    logger.warning(
+                        "Sample idx=%d failed, writing zero-score row and continuing: %s",
+                        global_idx,
+                        self._short_error_text(str(exc)),
+                    )
+                    out.append(
+                        self._build_error_row(
+                            sample=sample,
+                            sample_index=global_idx,
+                            routing_map=routing_map,
+                            m_dimensions=m_dimensions,
+                            routing_weight_mode=routing_weight_mode,
+                            attach_routing_meta=attach_routing_meta,
+                            include_prompt=include_prompt,
+                            error=exc,
+                        )
+                    )
             return out, start, end
 
         results: List[Optional[Dict[str, Any]]] = [None] * len(selected)
@@ -459,7 +591,27 @@ class DeepSeekAlpagasusVectorScorer:
             try:
                 for future in as_completed(futures):
                     idx = futures[future]
-                    results[idx] = future.result()
+                    global_idx = start + idx
+                    try:
+                        results[idx] = future.result()
+                    except Exception as exc:
+                        if fail_fast:
+                            raise
+                        logger.warning(
+                            "Sample idx=%d failed, writing zero-score row and continuing: %s",
+                            global_idx,
+                            self._short_error_text(str(exc)),
+                        )
+                        results[idx] = self._build_error_row(
+                            sample=selected[idx],
+                            sample_index=global_idx,
+                            routing_map=routing_map,
+                            m_dimensions=m_dimensions,
+                            routing_weight_mode=routing_weight_mode,
+                            attach_routing_meta=attach_routing_meta,
+                            include_prompt=include_prompt,
+                            error=exc,
+                        )
                     if progress:
                         progress.update(1)
             finally:
@@ -516,6 +668,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--starting_sample", type=int, default=0, help="Start index in dataset.")
     parser.add_argument("--max_retries", type=int, default=3, help="Retry attempts per API call.")
     parser.add_argument("--timeout", type=int, default=120, help="HTTP timeout in seconds.")
+    parser.add_argument("--connect_timeout", type=float, default=10.0, help="HTTP connect timeout in seconds.")
     parser.add_argument("--retry_sleep", type=float, default=2.0, help="Base sleep seconds between retries.")
     parser.add_argument(
         "--concurrency",
@@ -526,6 +679,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of concurrent worker threads.",
     )
     parser.add_argument("--dry_run", action="store_true", dest="dry_run")
+    parser.add_argument(
+        "--fail_fast",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true, stop immediately when any sample fails. Default is continue with zero-score row.",
+    )
     parser.add_argument(
         "--attach_routing_meta",
         action=argparse.BooleanOptionalAction,
@@ -551,6 +710,7 @@ def main() -> None:
         model=args.model,
         base_url=args.base_url,
         request_timeout=args.timeout,
+        connect_timeout=args.connect_timeout,
         max_retries=args.max_retries,
         retry_sleep=args.retry_sleep,
     )
@@ -595,6 +755,7 @@ def main() -> None:
         max_tokens=args.max_tokens,
         attach_routing_meta=bool(args.attach_routing_meta),
         include_prompt=bool(args.include_prompt),
+        fail_fast=bool(args.fail_fast),
     )
 
     output_dir = os.path.dirname(args.output_path)

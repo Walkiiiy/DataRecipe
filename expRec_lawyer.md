@@ -118,9 +118,9 @@ python3 /home/walkiiiy/DataRecipe/src/4.2/alpagasus/alpagasus_origin_sample.py \
 
 #  alpagasus_improved：保持原评分逻辑 + 映射到能力维向量
 python3 src/4.2/alpagasus/alpagasus_improved.py \
-  --data_path data/banking77/train.jsonl \
-  --routing_path data/banking77/train_coarse_topk5.jsonl \
-  --output_path data/banking77/score/alpagasus_improved_mapped.jsonl \
+  --data_path data/lawyer/train.jsonl \
+  --routing_path data/lawyer/train_coarse_topk5.jsonl \
+  --output_path data/lawyer/score/alpagasus_improved_mapped.jsonl \
   --model deepseek-chat \
   --base_url https://api.deepseek.com \
   --temperature 0.01 \
@@ -128,7 +128,11 @@ python3 src/4.2/alpagasus/alpagasus_improved.py \
   --routing_weight_mode coarse \
   --concurrency 16
 
-
+python3 /home/walkiiiy/DataRecipe/src/4.2/alpagasus/alpagasus_improved_sample.py \
+  --score_path /home/walkiiiy/DataRecipe/data/lawyer/score/alpagasus_improved_mapped.jsonl \
+  --data_path /home/walkiiiy/DataRecipe/data/lawyer/train.jsonl \
+  --output_path /home/walkiiiy/DataRecipe/data/lawyer/exp4.2/dataset_alpagasus_improved_1000.jsonl \
+  --num_samples 1000
 ================================================================================
 # instag
 python3 src/4.2/instag/instag.py \
@@ -140,40 +144,38 @@ python3 src/4.2/instag/instag.py \
 
 采样
 python3 src/4.2/instag/instag_sample.py \
-  --data_path data/banking77/train.jsonl \
-  --tag_path data/banking77/score/instag_tags.jsonl \
-  --output_path data/banking77/exp4.2/dataset_instag.jsonl \
+  --data_path data/lawyer/train.jsonl \
+  --tag_path data/lawyer/score/instag_tags.jsonl \
+  --output_path data/lawyer/exp4.2/dataset_instag_1000.jsonl \
   --num_samples 1000
 =======================================================
 # MIG
 - python3 src/4.2/mig/mig.py \
-  --data_path data/banking77/train.jsonl \
-  --instag_path data/banking77/score/instag_tags.jsonl \
-  --delta_path data/banking77/score/delta_origin_mapped.jsonl \
-  --output_path data/banking77/score/mig_scored.jsonl \
-  --cluster_output_path data/banking77/score/mig_tag_clusters.json \
-  --valid_tag_output_path data/banking77/score/mig_valid_tags.json \
+  --data_path data/lawyer/train.jsonl \
+  --instag_path data/lawyer/score/instag_tags.jsonl \
+  --delta_path data/lawyer/score/delta_origin_mapped.jsonl \
+  --output_path data/lawyer/score/mig_scored.jsonl \
+  --cluster_output_path data/lawyer/score/mig_tag_clusters.json \
+  --valid_tag_output_path data/lawyer/score/mig_valid_tags.json \
   --tag_merge_eps 0.05 \
   --delta_scalar_mode auto \
   --embedding_backend auto
 
 采样
 - python3 src/4.2/mig/mig_sample.py \
-  --scored_path data/banking77/score/mig_scored.jsonl \
-  --output_path data/banking77/exp4.2/dataset_mig.jsonl \
-  --num_samples 1000 \
-  --meta_output_path data/banking77/score/mig_sample_meta.json \
-  --embedding_backend auto
+  --scored_path data/lawyer/score/mig_scored.jsonl \
+  --output_path data/lawyer/exp4.2/dataset_mig_2000.jsonl \
+  --num_samples 2000 
 
 
 
 
 ============================================================================
 
-- datawhisperer
+# datawhisperer
 python3 src/4.2/datawhisperer/datawhisperer.py \
-  --data_path data/banking77/train.jsonl \
-  --output_path data/banking77/score/datawhisperer_icl_mapped.jsonl \
+  --data_path data/lawyer/train.jsonl \
+  --output_path data/lawyer/score/datawhisperer_icl_mapped.jsonl \
   --model_name_or_path ~/.cache/modelscope/hub/models/Qwen/Qwen2.5-0.5B-Instruct \
   --n_demonstrations 10 \
   --n_queries 5 \
@@ -183,9 +185,29 @@ python3 src/4.2/datawhisperer/datawhisperer.py \
   --concurrency 2 \
   --max_new_tokens 16 \
   --max_input_tokens 2048 \
-  --select_top_k 1000
+  --select_top_k 2000
+
+==============================================================
+# PDM
+python src/4.2/PDM/pdm.py \
+  --data_path data/lawyer/train.jsonl \
+  --srm_path data/lawyer/score/srm_from_topk5_only.jsonl \
+  --output_path data/lawyer/score/pdm_scored.jsonl \
+  --model_name_or_path ~/.cache/modelscope/hub/models/Qwen/Qwen2.5-0.5B \
+  --context_size 4 \
+  --global_trials 3 \
+  --max_seq_len 1024 \
+  --nll_batch_size 8 \
+  --no-cache_token_ids \
+  --device_map auto
 
 
+python src/4.2/PDM/pdm_sample.py \
+  --score_path data/lawyer/score/pdm_scored.jsonl \
+  --data_path data/lawyer/train.jsonl \
+  --output_path data/lawyer/exp4.2/dataset_pdm_1000.jsonl \
+  --num_samples 1000 \
+  --annotate_selection
 ===============================================================================================
 # 随机采样
 python src/scripts/sample_train_subset.py \
@@ -198,22 +220,25 @@ python src/scripts/sample_train_subset.py \
 
 # 训练
 python src/4.1/EXP/sft_lora_train_shared_eval.py \
-  --run srm::data/lawyer/exp4.2/dataset_srm_1000.jsonl::data/lawyer/exp4.2/run_srm_1000_shared_eval \
-  --run random::data/lawyer/exp4.2/dataset_random_1000.jsonl::data/lawyer/exp4.2/run_random_1000_shared_eval \
   --eval-source-jsonl data/lawyer/test.jsonl \
   --eval-ratio 1 \
   --seed 42 \
   --num_train_epochs 4 \
   --output-root data/lawyer/exp/shared_eval \
-  --base_model Qwen/Qwen2.5-0.5B
+  --base_model Qwen/Qwen2.5-0.5B \
+  --run alpagasus_origin::data/lawyer/exp4.2/dataset_alpagasus_origin_1000.jsonl::data/lawyer/exp4.2/run_alpagasus_origin_1000_shared_eval 
 
+  --run delta_improved::data/lawyer/exp4.2/dataset_delta_improved_1000.jsonl::data/lawyer/exp4.2/run_delta_improved_1000_shared_eval 
+  
 
   <!-- --base_model Qwen/Qwen3-4B-Instruct-2507   JunHowie/Qwen3-8B-Instruct -->
 
+--run delta_origin::data/lawyer/exp4.2/dataset_delta_origin_1000.jsonl::data/lawyer/exp4.2/run_delta_origin_1000_shared_eval \
+  
+  --run srm::data/lawyer/exp4.2/dataset_srm_1000.jsonl::data/lawyer/exp4.2/run_srm_1000_shared_eval \
+  --run random::data/lawyer/exp4.2/dataset_random_1000.jsonl::data/lawyer/exp4.2/run_random_1000_shared_eval \
 
-  --run delta_improved::data/lawyer/exp4.2/dataset_delta_improved_1000.jsonl::data/lawyer/exp4.2/run_delta_improved_1000_shared_eval \
-  --run delta_origin::data/lawyer/exp4.2/dataset_delta_origin_1000.jsonl::data/lawyer/exp4.2/run_delta_origin_1000_shared_eval \
-  --run alpagasus_origin::data/lawyer/exp4.2/dataset_alpagasus_origin_1000.jsonl::data/lawyer/exp4.2/run_alpagasus_origin_1000_shared_eval \
+
 
 
 # EM评估
@@ -222,13 +247,20 @@ python src/4.1/EXP/eval_checkpoints_em.py \
   --eval-size 1446 \
   --base_model Qwen/Qwen2.5-0.5B \
   --model_source modelscope \
+  --run alpagasus_origin::data/lawyer/exp4.2/run_alpagasus_origin_1000_shared_eval/final_checkpoint 
+ 
+ 
+  --run delta_improved::data/lawyer/exp4.2/run_delta_improved_1000_shared_eval/final_checkpoint 
+
+  --run delta_origin::data/lawyer/exp4.2/run_delta_origin_1000_shared_eval/final_checkpoint 
+
+
   --run random::data/lawyer/exp4.2/run_random_1000_shared_eval/final_checkpoint \
   --run srm::data/lawyer/exp4.2/run_srm_1000_shared_eval/final_checkpoint
 
 
-  --run delta_origin::data/lawyer/exp4.2/run_delta_origin_1000_shared_eval/final_checkpoint \
-  --run alpagasus_origin::data/lawyer/exp4.2/run_alpagasus_origin_1000_shared_eval/final_checkpoint 
 
+ 
 
 
   --run delta_improved::data/lawyer/exp4.2/run_delta_improved_1000_shared_eval/final_checkpoint \
@@ -244,7 +276,7 @@ python src/4.1/EXP/eval_checkpoints_bertscore.py \
   --eval-source-jsonl data/lawyer/train.jsonl \
   --eval-size 500 \
   --bertscore-lang-mode auto \
-  --run srm::data/lawyer/exp4.2/run_srm_200_shared_eval/final_checkpoint \
-  --run random::data/lawyer/exp4.2/run_random_200_shared_eval/final_checkpoint \
+  --run srm::data/lawyer/exp4.2/run_srm_1000_shared_eval/final_checkpoint \
+  --run random::data/lawyer/exp4.2/run_random_1000_shared_eval/final_checkpoint \
   --output-dir data/lawyer/exp4.2/bertscore_eval \
   --save-per-run-jsonl
