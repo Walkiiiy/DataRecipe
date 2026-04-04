@@ -11,6 +11,9 @@ set -Eeuo pipefail
 #   LAWYER_EVAL_SOURCE=data/lawyer/test.jsonl
 #   LAWYER_EVAL_SIZE=2147
 #   LAWYER_EXP_ROOT=data/lawyer/exp4.2
+#   LAWYER_METHODS="pdm instag mig ..."  # optional; default auto-discover from dataset files
+#   RUN_FULL_EVAL=1                      # 1/0, whether to eval full_data checkpoint
+#   RUN_BASE_EVAL=1                      # 1/0, whether to eval unfinetuned base model
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
@@ -25,10 +28,12 @@ LAWYER_EVAL_SIZE="${LAWYER_EVAL_SIZE:-2147}"
 LAWYER_EXP_ROOT="${LAWYER_EXP_ROOT:-data/lawyer/exp4.2}"
 
 EVAL_SCRIPT="src/4.1/EXP/eval_checkpoints_em.py"
-METHOD="pdm"
 FULL_METHOD="full_data"
 BASE_EVAL_METHOD="base_model"
-PDM_SIZES=(200 1000 2000)
+SIZES=(200 1000 2000)
+RUN_FULL_EVAL="${RUN_FULL_EVAL:-1}"
+RUN_BASE_EVAL="${RUN_BASE_EVAL:-1}"
+LAWYER_METHODS="${LAWYER_METHODS:-}"
 
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 LOG_DIR="${ROOT_DIR}/logs/exp6/${TIMESTAMP}"
@@ -113,9 +118,10 @@ run_step() {
   echo "[DONE] Step ${idx} (${title}) at $(date '+%F %T')"
 }
 
-pdm_checkpoint_dir() {
-  local size="$1"
-  echo "${LAWYER_EXP_ROOT}/run_${METHOD}_${size}_shared_eval/final_checkpoint"
+method_checkpoint_dir() {
+  local method="$1"
+  local size="$2"
+  echo "${LAWYER_EXP_ROOT}/run_${method}_${size}_shared_eval/final_checkpoint"
 }
 
 full_checkpoint_dir() {
@@ -137,6 +143,75 @@ eval_checkpoint() {
     --base_model "$BASE_MODEL" \
     --model_source "$MODEL_SOURCE" \
     --run "${tag}::${checkpoint_dir}"
+}
+
+LAWYER_METHODS_ARR=()
+discover_lawyer_methods() {
+  LAWYER_METHODS_ARR=()
+
+  if [[ -n "$LAWYER_METHODS" ]]; then
+    local raw
+    raw="${LAWYER_METHODS//,/ }"
+    # shellcheck disable=SC2206
+    LAWYER_METHODS_ARR=($raw)
+  else
+    local -A seen=()
+    local file
+    local base
+    local method
+    shopt -s nullglob
+    for file in "${LAWYER_EXP_ROOT}"/dataset_*_200.jsonl \
+                "${LAWYER_EXP_ROOT}"/dataset_*_1000.jsonl \
+                "${LAWYER_EXP_ROOT}"/dataset_*_2000.jsonl; do
+      base="$(basename "$file")"
+      if [[ "$base" =~ ^dataset_(.+)_(200|1000|2000)\.jsonl$ ]]; then
+        method="${BASH_REMATCH[1]}"
+        seen["$method"]=1
+      fi
+    done
+    shopt -u nullglob
+
+    if (( ${#seen[@]} > 0 )); then
+      local sorted
+      sorted="$(printf '%s\n' "${!seen[@]}" | sort)"
+      while IFS= read -r method; do
+        [[ -n "$method" ]] && LAWYER_METHODS_ARR+=("$method")
+      done <<< "$sorted"
+    fi
+  fi
+
+  if (( ${#LAWYER_METHODS_ARR[@]} == 0 )); then
+    echo "[ERROR] No lawyer methods found."
+    echo "[ERROR] Set LAWYER_METHODS explicitly or make sure dataset_<method>_{200,1000,2000}.jsonl exists under ${LAWYER_EXP_ROOT}."
+    exit 1
+  fi
+}
+
+require_method_datasets() {
+  local method="$1"
+  local size
+  for size in "${SIZES[@]}"; do
+    require_file "${LAWYER_EXP_ROOT}/dataset_${method}_${size}.jsonl"
+  done
+}
+
+eval_method_size() {
+  local method="$1"
+  local size="$2"
+  local checkpoint_dir
+  checkpoint_dir="$(method_checkpoint_dir "$method" "$size")"
+
+  if [[ "$DRY_RUN" != "1" ]]; then
+    require_path "$checkpoint_dir"
+  fi
+
+  run_step "lawyer eval ${method} ${size}" \
+    "$PYTHON_BIN" "$EVAL_SCRIPT" \
+    --eval-source-jsonl "$LAWYER_EVAL_SOURCE" \
+    --eval-size "$LAWYER_EVAL_SIZE" \
+    --base_model "$BASE_MODEL" \
+    --model_source "$MODEL_SOURCE" \
+    --run "${method}::${checkpoint_dir}"
 }
 
 BASE_MODEL_EVAL_PATH=""
@@ -189,14 +264,32 @@ info "DRY_RUN:   $DRY_RUN"
 require_file "$EVAL_SCRIPT"
 require_file "$LAWYER_EVAL_SOURCE"
 
-for size in "${PDM_SIZES[@]}"; do
-  eval_checkpoint "${METHOD}" "$(pdm_checkpoint_dir "$size")"
+discover_lawyer_methods
+info "Lawyer methods: ${LAWYER_METHODS_ARR[*]}"
+info "SIZES:          ${SIZES[*]}"
+info "RUN_FULL_EVAL:  ${RUN_FULL_EVAL}"
+info "RUN_BASE_EVAL:  ${RUN_BASE_EVAL}"
+
+method=""
+for method in "${LAWYER_METHODS_ARR[@]}"; do
+  require_method_datasets "$method"
 done
 
-eval_checkpoint "$FULL_METHOD" "$(full_checkpoint_dir)"
+for method in "${LAWYER_METHODS_ARR[@]}"; do
+  size=""
+  for size in "${SIZES[@]}"; do
+    eval_method_size "$method" "$size"
+  done
+done
 
-resolve_base_model_eval_path
-eval_base_model
+if [[ "$RUN_FULL_EVAL" == "1" ]]; then
+  eval_checkpoint "$FULL_METHOD" "$(full_checkpoint_dir)"
+fi
+
+if [[ "$RUN_BASE_EVAL" == "1" ]]; then
+  resolve_base_model_eval_path
+  eval_base_model
+fi
 
 line
 echo "[SUCCESS] Lawyer eval steps finished."
