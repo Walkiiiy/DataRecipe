@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
     # RecipeEvolution hyper-params
     parser.add_argument("--num-steps", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--anchor-size-per-capability", type=int, default=2)
+    parser.add_argument("--anchor-size-per-capability", type=int, default=16)
     parser.add_argument("--anchor-chunk-size", type=int, default=8)
     parser.add_argument(
         "--anchor-refresh-interval",
@@ -69,10 +69,28 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="Recompute anchor gradients and beta every N steps. 1 means every step.",
     )
+    parser.add_argument(
+        "--anchor-ema-momentum",
+        type=float,
+        default=0.8,
+        help="EMA momentum for anchor gradients.",
+    )
     parser.add_argument("--eta-beta", type=float, default=0.1)
-    parser.add_argument("--gamma-alpha", type=float, default=0.8)
+    parser.add_argument("--gamma-alpha", type=float, default=5.0)
     parser.add_argument("--epsilon", type=float, default=0.05)
     parser.add_argument("--gamma-T", type=float, default=1.0)
+    parser.add_argument(
+        "--prune-patience",
+        type=int,
+        default=3,
+        help="Prune when consecutive bad rewards >= prune_patience.",
+    )
+    parser.add_argument(
+        "--prune-reward-threshold",
+        type=float,
+        default=-0.05,
+        help="Reward below this threshold is treated as bad sample.",
+    )
     parser.add_argument(
         "--mapper-utility-mode",
         type=str,
@@ -696,6 +714,9 @@ def main() -> None:
         gamma_alpha=args.gamma_alpha,
         epsilon=args.epsilon,
         gamma_T=args.gamma_T,
+        anchor_ema_momentum=args.anchor_ema_momentum,
+        prune_patience=args.prune_patience,
+        prune_reward_threshold=args.prune_reward_threshold,
         mapper_utility_mode=args.mapper_utility_mode,
         score_device="cpu",
     )
@@ -722,13 +743,22 @@ def main() -> None:
         refresh_interval = max(1, int(args.anchor_refresh_interval))
         need_refresh = anchor_grads is None or ((step - 1) % refresh_interval == 0)
 
-        if need_refresh:
+        running_anchor = evolver.get_running_anchor_gradients()
+        if need_refresh or running_anchor is None:
             anchor_indices = evolver.sample_anchor_indices(args.anchor_size_per_capability)
-            anchor_grads = evolver.compute_anchor_gradients(
+            current_anchor_grads = evolver.compute_anchor_gradients(
                 anchor_indices_by_capability=anchor_indices,
                 chunk_size=args.anchor_chunk_size,
             )
+            anchor_grads = evolver.update_running_anchor_gradients(
+                current_anchor_grads,
+                momentum=args.anchor_ema_momentum,
+            )
             evolver.update_beta(anchor_grads)
+        else:
+            anchor_grads = running_anchor
+            if anchor_grads is None:
+                raise RuntimeError("Running anchor gradients are unexpectedly None.")
 
         sampled_idx, _probs, _scores = evolver.score_and_sample_batch(batch_size=args.batch_size)
         batch = evolver._gather_pool_batch(sampled_idx)  # intentionally using internal helper
@@ -738,6 +768,12 @@ def main() -> None:
             batch_indices=sampled_idx,
             per_sample_grads=per_sample_grads,
             anchor_gradients=anchor_grads,
+        )
+        _bad_counter, pruned_mask = evolver.update_pruning_state(
+            batch_indices=sampled_idx,
+            rewards=rewards,
+            prune_patience=args.prune_patience,
+            prune_reward_threshold=args.prune_reward_threshold,
         )
         train_loss = evolver.train_on_sampled_batch(batch)
         utilities = evolver.compute_mapper_utilities(batch_indices=sampled_idx, rewards=rewards)
@@ -753,6 +789,8 @@ def main() -> None:
             "train_loss": float(train_loss),
             "avg_reward": float(rewards.mean().item()) if rewards.numel() > 0 else 0.0,
             "anchor_refreshed": bool(need_refresh),
+            "pruned_count": int(pruned_mask.sum().item()),
+            "active_count": int((~pruned_mask).sum().item()),
             "alpha": [float(x) for x in alpha_new.detach().cpu().tolist()],
             "utilities": [float(x) for x in utilities.detach().cpu().tolist()],
             "beta_top10": topk_pairs(evolver.beta.detach().cpu(), 10),
@@ -765,7 +803,8 @@ def main() -> None:
             print(
                 f"[Step {step}/{args.num_steps}] "
                 f"loss={train_loss:.4f} reward={log_row['avg_reward']:.4f} "
-                f"anchor_refresh={need_refresh} sec={elapsed:.2f}",
+                f"anchor_refresh={need_refresh} pruned={log_row['pruned_count']} "
+                f"active={log_row['active_count']} sec={elapsed:.2f}",
                 flush=True,
             )
 

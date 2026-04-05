@@ -180,6 +180,9 @@ class RecipeEvolver:
         gamma_alpha: float = 0.8,
         epsilon: float = 0.05,
         gamma_T: float = 1.0,
+        anchor_ema_momentum: float = 0.8,
+        prune_patience: int = 3,
+        prune_reward_threshold: float = -0.05,
         mapper_utility_mode: str = "beta_weighted",
         loss_fn: Optional[Callable[[Any, Mapping[str, Any]], torch.Tensor]] = None,
         score_device: Optional[torch.device | str] = None,
@@ -191,6 +194,9 @@ class RecipeEvolver:
         self.gamma_alpha = float(gamma_alpha)
         self.epsilon = float(epsilon)
         self.gamma_T = float(gamma_T)
+        self.anchor_ema_momentum = float(anchor_ema_momentum)
+        self.prune_patience = int(prune_patience)
+        self.prune_reward_threshold = float(prune_reward_threshold)
         self.mapper_utility_mode = str(mapper_utility_mode)
         self.loss_fn = loss_fn if loss_fn is not None else _infer_loss_from_outputs
 
@@ -261,6 +267,13 @@ class RecipeEvolver:
         # 预先建立 capability -> 样本索引表，用于锚点采样。
         self.capability_to_indices: List[torch.Tensor] = self._build_capability_index()
 
+        # EMA 锚点梯度状态（位于模型设备，供 beta 更新与奖励计算复用）。
+        self._running_anchor_grads: Optional[torch.Tensor] = None
+
+        # 动态修剪状态（位于 score_device，与打分/采样同设备）。
+        self.bad_strike_counter = torch.zeros((self.N,), dtype=torch.long, device=self.score_device)
+        self.pruned_mask = torch.zeros((self.N,), dtype=torch.bool, device=self.score_device)
+
         self.step_id = 0
         self.alpha_history: List[torch.Tensor] = [self.alpha.detach().clone().cpu()]
         self.beta_history: List[torch.Tensor] = [self.beta.detach().clone().cpu()]
@@ -290,6 +303,9 @@ class RecipeEvolver:
         gamma_alpha: float = 0.8,
         epsilon: float = 0.05,
         gamma_T: float = 1.0,
+        anchor_ema_momentum: float = 0.8,
+        prune_patience: int = 3,
+        prune_reward_threshold: float = -0.05,
         mapper_utility_mode: str = "beta_weighted",
         loss_fn: Optional[Callable[[Any, Mapping[str, Any]], torch.Tensor]] = None,
         score_device: Optional[torch.device | str] = None,
@@ -322,6 +338,9 @@ class RecipeEvolver:
             gamma_alpha=gamma_alpha,
             epsilon=epsilon,
             gamma_T=gamma_T,
+            anchor_ema_momentum=anchor_ema_momentum,
+            prune_patience=prune_patience,
+            prune_reward_threshold=prune_reward_threshold,
             mapper_utility_mode=mapper_utility_mode,
             loss_fn=loss_fn,
             score_device=score_device,
@@ -615,6 +634,80 @@ class RecipeEvolver:
 
         return anchor_grads
 
+    def update_running_anchor_gradients(
+        self,
+        current_anchor_gradients: torch.Tensor,
+        *,
+        momentum: Optional[float] = None,
+    ) -> torch.Tensor:
+        """用 EMA 更新锚点梯度状态。
+
+        公式：
+        - 首次：running = current
+        - 否则：running = momentum * running + (1 - momentum) * current
+        """
+        mom = self.anchor_ema_momentum if momentum is None else float(momentum)
+        mom = min(max(mom, 0.0), 0.999999)
+
+        with torch.no_grad():
+            cur = current_anchor_gradients.detach().to(self.model_device, dtype=torch.float32)
+            if self._running_anchor_grads is None:
+                self._running_anchor_grads = cur.clone()
+            else:
+                self._running_anchor_grads = mom * self._running_anchor_grads + (1.0 - mom) * cur
+            return self._running_anchor_grads.detach().clone()
+
+    def get_running_anchor_gradients(self) -> Optional[torch.Tensor]:
+        """返回当前 EMA 锚点梯度（若尚未初始化则返回 None）。"""
+        if self._running_anchor_grads is None:
+            return None
+        return self._running_anchor_grads.detach().clone()
+
+    def update_pruning_state(
+        self,
+        *,
+        batch_indices: torch.Tensor,
+        rewards: torch.Tensor,
+        prune_patience: Optional[int] = None,
+        prune_reward_threshold: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """根据 batch 奖励更新动态修剪状态。
+
+        返回：
+        - bad_strike_counter: `(N,)`
+        - pruned_mask: `(N,)`
+        """
+        patience = int(self.prune_patience if prune_patience is None else prune_patience)
+        threshold = float(self.prune_reward_threshold if prune_reward_threshold is None else prune_reward_threshold)
+        patience = max(1, patience)
+
+        with torch.no_grad():
+            idx = batch_indices.detach().to(self.score_device, dtype=torch.long).reshape(-1)
+            rw = rewards.detach().to(self.score_device, dtype=torch.float32).reshape(-1)
+            if idx.numel() == 0:
+                return self.bad_strike_counter, self.pruned_mask
+            if idx.numel() != rw.numel():
+                raise ValueError(
+                    f"batch_indices and rewards length mismatch: {idx.numel()} vs {rw.numel()}"
+                )
+
+            # good 样本连续计数清零
+            good_idx = idx[rw >= threshold]
+            if good_idx.numel() > 0:
+                good_idx = torch.unique(good_idx)
+                self.bad_strike_counter[good_idx] = 0
+
+            # bad 样本连续计数 +1（支持重复索引）
+            bad_idx = idx[rw < threshold]
+            if bad_idx.numel() > 0:
+                inc = torch.bincount(bad_idx, minlength=self.N)
+                if inc.numel() > self.N:
+                    inc = inc[: self.N]
+                self.bad_strike_counter = self.bad_strike_counter + inc.to(self.bad_strike_counter.dtype)
+
+            self.pruned_mask = self.pruned_mask | (self.bad_strike_counter >= patience)
+            return self.bad_strike_counter.detach().clone(), self.pruned_mask.detach().clone()
+
     # -----------------------------
     # 阶段 2：beta 更新
     # -----------------------------
@@ -644,6 +737,8 @@ class RecipeEvolver:
         """计算 `S(x) = alpha^T E_x beta`，输出 `(N,)`。"""
         with torch.no_grad():
             scores = torch.einsum("k,nkm,m->n", self.alpha, self.E_matrix, self.beta)
+            # 对已修剪样本施加极小分数，令其采样概率趋近于 0。
+            scores = scores.masked_fill(self.pruned_mask, -1e9)
         return scores
 
     def score_and_sample_batch(
@@ -667,6 +762,10 @@ class RecipeEvolver:
         tau = max(tau, 1e-8)
 
         with torch.no_grad():
+            active_count = int((~self.pruned_mask).sum().item())
+            if active_count <= 0:
+                raise RuntimeError("All samples are pruned; cannot sample batch.")
+
             scores = self.compute_global_scores()
             logits = scores / tau
             logits = logits - logits.max()
@@ -674,7 +773,7 @@ class RecipeEvolver:
 
             bsz = int(batch_size)
             if not replacement:
-                bsz = min(bsz, self.N)
+                bsz = min(bsz, active_count)
             sampled = torch.multinomial(probs, num_samples=bsz, replacement=replacement)
             return sampled, probs, scores
 
@@ -851,10 +950,11 @@ class RecipeEvolver:
         # 阶段 1：锚点梯度
         if anchor_indices_by_capability is None:
             anchor_indices_by_capability = self.sample_anchor_indices(anchor_size_per_capability)
-        anchor_grads = self.compute_anchor_gradients(
+        current_anchor_grads = self.compute_anchor_gradients(
             anchor_indices_by_capability=anchor_indices_by_capability,
             chunk_size=anchor_chunk_size,
         )
+        anchor_grads = self.update_running_anchor_gradients(current_anchor_grads)
 
         # 阶段 2：beta 更新
         beta_new = self.update_beta(anchor_grads, eta_beta=eta_beta)
@@ -874,6 +974,7 @@ class RecipeEvolver:
             per_sample_grads=per_sample_grads,
             anchor_gradients=anchor_grads,
         )
+        self.update_pruning_state(batch_indices=sampled_idx, rewards=rewards)
 
         # 先完成模型训练，再更新 alpha（alpha/beta 与模型图解耦）。
         train_loss = self.train_on_sampled_batch(sampled_batch)

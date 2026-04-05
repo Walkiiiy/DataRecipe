@@ -9,12 +9,12 @@ set -euo pipefail
 ROOT_DIR="/home/walkiiiy/DataRecipe"
 cd "$ROOT_DIR"
 
-BASE_MODEL="${BASE_MODEL:-$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-0.5B-Instruct}"
+BASE_MODEL="${BASE_MODEL:-$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-0.5B}"
 OUT_DIR="${OUT_DIR:-data/dialogsum/exp4.3/run_dialogsum_recipe}"
 
 STEPS="${STEPS:-200}"
 BATCH="${BATCH:-4}"
-ANCHOR_SIZE="${ANCHOR_SIZE:-1}"
+ANCHOR_SIZE="${ANCHOR_SIZE:-16}"
 ANCHOR_REFRESH="${ANCHOR_REFRESH:-20}"
 ANCHOR_CHUNK="${ANCHOR_CHUNK:-8}"
 MAX_LEN="${MAX_LEN:-384}"
@@ -23,9 +23,12 @@ MAX_CAP_DIM="${MAX_CAP_DIM:-128}"
 
 LR="${LR:-2e-4}"
 ETA_BETA="${ETA_BETA:-0.1}"
-GAMMA_ALPHA="${GAMMA_ALPHA:-0.8}"
+GAMMA_ALPHA="${GAMMA_ALPHA:-5.0}"
 EPSILON="${EPSILON:-0.05}"
 GAMMA_T="${GAMMA_T:-1.0}"
+ANCHOR_EMA_MOMENTUM="${ANCHOR_EMA_MOMENTUM:-0.8}"
+PRUNE_PATIENCE="${PRUNE_PATIENCE:-3}"
+PRUNE_REWARD_THRESHOLD="${PRUNE_REWARD_THRESHOLD:--0.05}"
 
 LORA_R="${LORA_R:-8}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
@@ -38,6 +41,7 @@ CMD=(
   --score-path data/dialogsum/score/pdm_scored.jsonl
   --score-path data/dialogsum/score/delta_improved_mapped.jsonl
   --score-path data/dialogsum/score/srm_from_topk5_only.jsonl
+  --score-path data/dialogsum/score/alpagasus_improved_mapped.jsonl
   --top-k-path data/dialogsum/train_coarse_topk5.jsonl
   --output-dir "$OUT_DIR"
   --base-model "$BASE_MODEL"
@@ -52,6 +56,9 @@ CMD=(
   --gamma-alpha "$GAMMA_ALPHA"
   --epsilon "$EPSILON"
   --gamma-T "$GAMMA_T"
+  --anchor-ema-momentum "$ANCHOR_EMA_MOMENTUM"
+  --prune-patience "$PRUNE_PATIENCE"
+  --prune-reward-threshold "$PRUNE_REWARD_THRESHOLD"
   --mapper-utility-mode beta_weighted
   --layer-name auto
   --lora-r "$LORA_R"
