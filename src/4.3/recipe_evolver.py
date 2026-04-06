@@ -846,7 +846,7 @@ class RecipeEvolver:
 
         # 某些模型包含 dropout 等随机算子时，需要声明 randomness 行为。
         try:
-            per_param_grads = vmap(grad_fn, in_dims=in_dims, randomness="different")(
+            per_param_grads = vmap(grad_fn, in_dims=in_dims, randomness="different", chunk_size=2)(
                 target_param_tuple, *dyn_vals
             )
         except TypeError:
