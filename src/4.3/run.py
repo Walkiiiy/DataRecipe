@@ -804,6 +804,15 @@ def main() -> None:
                 prune_patience=args.prune_patience,
                 prune_reward_threshold=args.prune_reward_threshold,
             )
+            utilities_i = evolver.compute_mapper_utilities(batch_indices=sampled_idx, rewards=rewards)
+
+            # 单样本梯度张量通常很大；在训练前显式释放并尝试清空 CUDA 缓存。
+            del per_sample_grads
+            del _probs
+            del _scores
+            if torch.cuda.is_available() and evolver.model_device.type == "cuda":
+                torch.cuda.empty_cache()
+
             loss_i = evolver.train_on_sampled_batch(
                 batch,
                 gradient_accumulation_steps=1,
@@ -811,7 +820,6 @@ def main() -> None:
                 zero_grad=False,
                 step_optimizer=False,
             )
-            utilities_i = evolver.compute_mapper_utilities(batch_indices=sampled_idx, rewards=rewards)
 
             loss_vals.append(float(loss_i))
             rewards_list.append(rewards.detach())
