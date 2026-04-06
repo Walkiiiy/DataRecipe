@@ -80,6 +80,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epsilon", type=float, default=0.05)
     parser.add_argument("--gamma-T", type=float, default=1.0)
     parser.add_argument(
+        "--frequency-penalty",
+        type=float,
+        default=0.1,
+        help="Penalty coefficient for repeatedly sampled data points.",
+    )
+    parser.add_argument(
         "--prune-patience",
         type=int,
         default=3,
@@ -109,6 +115,12 @@ def parse_args() -> argparse.Namespace:
     # Optim / model
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=1,
+        help="Number of micro-batches for gradient accumulation in each optimizer step.",
+    )
     parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "cpu"])
     parser.add_argument("--torch-dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     parser.add_argument(
@@ -714,6 +726,7 @@ def main() -> None:
         gamma_alpha=args.gamma_alpha,
         epsilon=args.epsilon,
         gamma_T=args.gamma_T,
+        frequency_penalty=args.frequency_penalty,
         anchor_ema_momentum=args.anchor_ema_momentum,
         prune_patience=args.prune_patience,
         prune_reward_threshold=args.prune_reward_threshold,
@@ -723,6 +736,12 @@ def main() -> None:
 
     print(
         f"[Recipe] N={evolver.N} k={evolver.k} m={evolver.m} K_max={evolver.K_max} gradient_dim={evolver.gradient_dim}",
+        flush=True,
+    )
+    effective_train_batch = args.batch_size * max(1, int(args.gradient_accumulation_steps))
+    print(
+        f"[Train] sampled_batch={args.batch_size} grad_accum={max(1, int(args.gradient_accumulation_steps))} "
+        f"effective_train_batch={effective_train_batch}",
         flush=True,
     )
 
@@ -735,6 +754,8 @@ def main() -> None:
     beta_hist_path = args.output_dir / "beta_history.pt"
 
     anchor_grads: torch.Tensor | None = None
+
+    grad_accum_steps = max(1, int(args.gradient_accumulation_steps))
 
     t0 = time.time()
     for step in range(1, args.num_steps + 1):
@@ -760,23 +781,50 @@ def main() -> None:
             if anchor_grads is None:
                 raise RuntimeError("Running anchor gradients are unexpectedly None.")
 
-        sampled_idx, _probs, _scores = evolver.score_and_sample_batch(batch_size=args.batch_size)
-        batch = evolver._gather_pool_batch(sampled_idx)  # intentionally using internal helper
+        evolver.optimizer.zero_grad(set_to_none=True)
 
-        per_sample_grads = evolver.compute_per_sample_layer_gradients_vmap(batch)
-        rewards = evolver.compute_local_rewards(
-            batch_indices=sampled_idx,
-            per_sample_grads=per_sample_grads,
-            anchor_gradients=anchor_grads,
-        )
-        _bad_counter, pruned_mask = evolver.update_pruning_state(
-            batch_indices=sampled_idx,
-            rewards=rewards,
-            prune_patience=args.prune_patience,
-            prune_reward_threshold=args.prune_reward_threshold,
-        )
-        train_loss = evolver.train_on_sampled_batch(batch)
-        utilities = evolver.compute_mapper_utilities(batch_indices=sampled_idx, rewards=rewards)
+        loss_vals: List[float] = []
+        rewards_list: List[torch.Tensor] = []
+        utilities_list: List[torch.Tensor] = []
+        pruned_mask = evolver.pruned_mask
+
+        for _acc_idx in range(grad_accum_steps):
+            sampled_idx, _probs, _scores = evolver.score_and_sample_batch(batch_size=args.batch_size)
+            batch = evolver._gather_pool_batch(sampled_idx)  # intentionally using internal helper
+
+            per_sample_grads = evolver.compute_per_sample_layer_gradients_vmap(batch)
+            rewards = evolver.compute_local_rewards(
+                batch_indices=sampled_idx,
+                per_sample_grads=per_sample_grads,
+                anchor_gradients=anchor_grads,
+            )
+            _bad_counter, pruned_mask = evolver.update_pruning_state(
+                batch_indices=sampled_idx,
+                rewards=rewards,
+                prune_patience=args.prune_patience,
+                prune_reward_threshold=args.prune_reward_threshold,
+            )
+            loss_i = evolver.train_on_sampled_batch(
+                batch,
+                gradient_accumulation_steps=1,
+                loss_divisor=float(grad_accum_steps),
+                zero_grad=False,
+                step_optimizer=False,
+            )
+            utilities_i = evolver.compute_mapper_utilities(batch_indices=sampled_idx, rewards=rewards)
+
+            loss_vals.append(float(loss_i))
+            rewards_list.append(rewards.detach())
+            utilities_list.append(utilities_i.detach())
+
+        evolver.optimizer.step()
+
+        train_loss = float(sum(loss_vals) / max(1, len(loss_vals)))
+        rewards = torch.cat(rewards_list, dim=0) if rewards_list else torch.zeros(0, dtype=torch.float32)
+        if utilities_list:
+            utilities = torch.stack(utilities_list, dim=0).mean(dim=0)
+        else:
+            utilities = torch.zeros((evolver.k,), dtype=torch.float32, device=evolver.score_device)
         alpha_new = evolver.update_alpha(utilities)
 
         evolver.step_id += 1
@@ -788,6 +836,8 @@ def main() -> None:
             "step": int(step),
             "train_loss": float(train_loss),
             "avg_reward": float(rewards.mean().item()) if rewards.numel() > 0 else 0.0,
+            "sampled_total": int(rewards.numel()),
+            "grad_accum_steps": int(grad_accum_steps),
             "anchor_refreshed": bool(need_refresh),
             "pruned_count": int(pruned_mask.sum().item()),
             "active_count": int((~pruned_mask).sum().item()),

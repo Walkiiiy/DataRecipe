@@ -4,10 +4,12 @@ set -euo pipefail
 # Usage:
 #   bash src/4.3/run.sh
 # Optional overrides:
-#   STEPS=300 BATCH=8 ANCHOR_REFRESH=20 MAX_CAP_DIM=128 MAX_SAMPLES=0 bash src/4.3/run.sh
+#   STEPS=300 BATCH=8 GRAD_ACCUM=2 ANCHOR_REFRESH=20 MAX_CAP_DIM=128 MAX_SAMPLES=0 bash src/4.3/run.sh
+# Notes:
+#   Effective train batch ~= BATCH * GRAD_ACCUM (GRAD_ACCUM 次独立采样后再统一 optimizer.step)。
 
-ROOT_DIR="/home/walkiiiy/DataRecipe"
-cd "$ROOT_DIR"
+# ROOT_DIR="~/DataRecipe"
+# cd "$ROOT_DIR"
 
 BASE_MODEL="${BASE_MODEL:-$HOME/.cache/modelscope/hub/models/Qwen/Qwen2.5-0.5B}"
 OUT_DIR="${OUT_DIR:-data/dialogsum/exp4.3/run_dialogsum_recipe}"
@@ -22,10 +24,12 @@ MAX_SAMPLES="${MAX_SAMPLES:-0}"
 MAX_CAP_DIM="${MAX_CAP_DIM:-128}"
 
 LR="${LR:-2e-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-1}"
 ETA_BETA="${ETA_BETA:-0.1}"
 GAMMA_ALPHA="${GAMMA_ALPHA:-5.0}"
 EPSILON="${EPSILON:-0.05}"
 GAMMA_T="${GAMMA_T:-1.0}"
+FREQ_PENALTY="${FREQ_PENALTY:-0.1}"
 ANCHOR_EMA_MOMENTUM="${ANCHOR_EMA_MOMENTUM:-0.8}"
 PRUNE_PATIENCE="${PRUNE_PATIENCE:-3}"
 PRUNE_REWARD_THRESHOLD="${PRUNE_REWARD_THRESHOLD:--0.05}"
@@ -35,14 +39,17 @@ LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 DRY_RUN="${DRY_RUN:-0}"
 
+
+DATASET="${DATASET:-dialogsum}"
+
 CMD=(
   python src/4.3/run.py
-  --train-jsonl data/dialogsum/train.jsonl
-  --score-path data/dialogsum/score/pdm_scored.jsonl
-  --score-path data/dialogsum/score/delta_improved_mapped.jsonl
-  --score-path data/dialogsum/score/srm_from_topk5_only.jsonl
-  --score-path data/dialogsum/score/alpagasus_improved_mapped.jsonl
-  --top-k-path data/dialogsum/train_coarse_topk5.jsonl
+  --train-jsonl data/"$DATASET"/train.jsonl
+  --score-path data/"$DATASET"/score/pdm_scored.jsonl
+  --score-path data/"$DATASET"/score/delta_improved_mapped.jsonl
+  --score-path data/"$DATASET"/score/srm_from_topk5_only.jsonl
+  --score-path data/"$DATASET"/score/alpagasus_improved_mapped.jsonl
+  --top-k-path data/"$DATASET"/train_coarse_topk5.jsonl
   --output-dir "$OUT_DIR"
   --base-model "$BASE_MODEL"
   --num-steps "$STEPS"
@@ -52,10 +59,12 @@ CMD=(
   --anchor-chunk-size "$ANCHOR_CHUNK"
   --max-length "$MAX_LEN"
   --lr "$LR"
+  --gradient-accumulation-steps "$GRAD_ACCUM"
   --eta-beta "$ETA_BETA"
   --gamma-alpha "$GAMMA_ALPHA"
   --epsilon "$EPSILON"
   --gamma-T "$GAMMA_T"
+  --frequency-penalty "$FREQ_PENALTY"
   --anchor-ema-momentum "$ANCHOR_EMA_MOMENTUM"
   --prune-patience "$PRUNE_PATIENCE"
   --prune-reward-threshold "$PRUNE_REWARD_THRESHOLD"

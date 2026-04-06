@@ -180,6 +180,7 @@ class RecipeEvolver:
         gamma_alpha: float = 0.8,
         epsilon: float = 0.05,
         gamma_T: float = 1.0,
+        frequency_penalty: float = 0.1,
         anchor_ema_momentum: float = 0.8,
         prune_patience: int = 3,
         prune_reward_threshold: float = -0.05,
@@ -194,6 +195,7 @@ class RecipeEvolver:
         self.gamma_alpha = float(gamma_alpha)
         self.epsilon = float(epsilon)
         self.gamma_T = float(gamma_T)
+        self.frequency_penalty = max(0.0, float(frequency_penalty))
         self.anchor_ema_momentum = float(anchor_ema_momentum)
         self.prune_patience = int(prune_patience)
         self.prune_reward_threshold = float(prune_reward_threshold)
@@ -273,6 +275,8 @@ class RecipeEvolver:
         # 动态修剪状态（位于 score_device，与打分/采样同设备）。
         self.bad_strike_counter = torch.zeros((self.N,), dtype=torch.long, device=self.score_device)
         self.pruned_mask = torch.zeros((self.N,), dtype=torch.bool, device=self.score_device)
+        # 采样频次计数（位于 score_device），用于频次惩罚避免 mode collapse。
+        self.sample_counts = torch.zeros((self.N,), dtype=torch.long, device=self.score_device)
 
         self.step_id = 0
         self.alpha_history: List[torch.Tensor] = [self.alpha.detach().clone().cpu()]
@@ -767,7 +771,9 @@ class RecipeEvolver:
                 raise RuntimeError("All samples are pruned; cannot sample batch.")
 
             scores = self.compute_global_scores()
-            logits = scores / tau
+            logits = (scores / tau) - (
+                self.frequency_penalty * self.sample_counts.to(dtype=scores.dtype)
+            )
             logits = logits - logits.max()
             probs = torch.softmax(logits, dim=0)
 
@@ -775,6 +781,11 @@ class RecipeEvolver:
             if not replacement:
                 bsz = min(bsz, active_count)
             sampled = torch.multinomial(probs, num_samples=bsz, replacement=replacement)
+            if sampled.numel() > 0:
+                inc = torch.bincount(sampled, minlength=self.N)
+                if inc.numel() > self.N:
+                    inc = inc[: self.N]
+                self.sample_counts = self.sample_counts + inc.to(self.sample_counts.dtype)
             return sampled, probs, scores
 
     # -----------------------------
@@ -920,15 +931,67 @@ class RecipeEvolver:
             self.alpha = self.alpha / self.alpha.sum().clamp_min(1e-12)
             return self.alpha.detach().clone()
 
-    def train_on_sampled_batch(self, batch: Mapping[str, torch.Tensor]) -> float:
-        """用采样 batch 做一次标准参数更新（训练主模型）。"""
+    def train_on_sampled_batch(
+        self,
+        batch: Mapping[str, torch.Tensor],
+        *,
+        gradient_accumulation_steps: int = 1,
+        loss_divisor: float = 1.0,
+        zero_grad: bool = True,
+        step_optimizer: bool = True,
+    ) -> float:
+        """用采样 batch 做一次参数更新（支持梯度累积）。
+
+        参数：
+        - gradient_accumulation_steps: 把一个 batch 切成多个微批次累积梯度，
+          最后只执行一次 optimizer.step()。
+        - loss_divisor: 额外 loss 缩放因子（用于跨采样批次的梯度累积）。
+        - zero_grad: 是否在本次调用前清梯度。
+        - step_optimizer: 是否在本次调用后执行 optimizer.step()。
+        """
         self.model.train()
-        self.optimizer.zero_grad(set_to_none=True)
-        outputs = self.model(**batch)
-        loss = self.loss_fn(outputs, batch)
-        loss.backward()
-        self.optimizer.step()
-        return float(loss.detach().item())
+
+        dyn_keys, dyn_vals = self._split_dynamic_batch_fields(batch)
+        if not dyn_keys:
+            raise ValueError("No dynamic tensor fields found in batch for training.")
+        bsz = int(dyn_vals[0].size(0))
+        if bsz <= 0:
+            raise ValueError("Empty batch is not allowed for training.")
+
+        accum_steps = max(1, int(gradient_accumulation_steps))
+        micro_bsz = max(1, (bsz + accum_steps - 1) // accum_steps)
+
+        micro_ranges: List[Tuple[int, int]] = []
+        for start in range(0, bsz, micro_bsz):
+            end = min(bsz, start + micro_bsz)
+            if end > start:
+                micro_ranges.append((start, end))
+        num_micro = max(1, len(micro_ranges))
+
+        if zero_grad:
+            self.optimizer.zero_grad(set_to_none=True)
+
+        loss_sum = 0.0
+        for start, end in micro_ranges:
+            micro_batch: Dict[str, torch.Tensor] = {}
+            for key, value in batch.items():
+                if torch.is_tensor(value) and value.dim() > 0 and value.size(0) == bsz:
+                    micro_batch[key] = value[start:end]
+                else:
+                    micro_batch[key] = value
+
+            outputs = self.model(**micro_batch)
+            loss = self.loss_fn(outputs, micro_batch)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss encountered: {loss.item()}")
+
+            total_div = float(num_micro) * max(float(loss_divisor), 1e-12)
+            (loss / total_div).backward()
+            loss_sum += float(loss.detach().item())
+
+        if step_optimizer:
+            self.optimizer.step()
+        return loss_sum / float(num_micro)
 
     # -----------------------------
     # 单步执行：1->2->3->4
