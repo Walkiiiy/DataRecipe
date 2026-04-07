@@ -246,6 +246,8 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
 
 
   
+# re
+DATASET="dolly" OUT_DIR="data/dolly/exp4.7.1/run_dolly_recipe_130" TRAIN_SIZE=130 EPOCHS=4 BATCH=1 GRAD_ACCUM=4 MAX_LEN=256 MAX_CAP_DIM=32 ANCHOR_SIZE=2 ANCHOR_CAP_REFRESH=2 ANCHOR_REFRESH=40 ANCHOR_CHUNK=2 RECIPE_UPDATE_INTERVAL=4 GAMMA_T=0.3 FREQ_PENALTY=0.01 STATIC_FLOOR_RATIO=0.3 UNIFORM_FLOOR_RATIO=0.01 TORCH_DTYPE=fp16 GRAD_CKPT=1 LOG_EVERY=1 SAVE_EVERY=0 bash src/4.3/run.sh
 
 
 # EM评估
@@ -254,6 +256,11 @@ python src/4.1/EXP/eval_checkpoints_em.py \
   --eval-size 1446 \
   --base_model Qwen/Qwen2.5-0.5B \
   --model_source modelscope \
+  --run re::data/dolly/exp4.7.1/run_dolly_recipe/final
+
+
+
+
   --run alpagasus_origin::data/dolly/exp4.2/run_alpagasus_improved_130_shared_eval/final_checkpoint 
 
   --run alpagasus_origin::data/dolly/exp4.2/run_alpagasus_origin_130_shared_eval/final_checkpoint 
