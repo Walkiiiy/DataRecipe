@@ -219,6 +219,13 @@ class RecipeEvolver:
             raise ValueError("E_matrix and top_k_indices must share the same N.")
 
         self.E_matrix = E_matrix.detach().to(self.score_device, dtype=torch.float32)
+        # Runtime normalization:
+        # 对每条样本、每个 mapper 的 m 维向量做 L1 归一化（dim=2），
+        # 把不同 mapper 的量级对齐到可比较尺度，避免某个 mapper 因绝对值过大而“霸权”。
+        # 这里使用 abs().sum 作为分母，兼容潜在负值；并用 clamp_min 防止除零导致 NaN。
+        eps = 1e-8
+        l1_denom = self.E_matrix.abs().sum(dim=2, keepdim=True).clamp_min(eps)  # (N, k, 1)
+        self.E_matrix = self.E_matrix / l1_denom
         self.top_k_indices = top_k_indices.detach().to(self.score_device, dtype=torch.long)
         self.N, self.k, self.m = self.E_matrix.shape
         self.K_max = self.top_k_indices.size(1)
