@@ -247,7 +247,32 @@ python src/4.1/EXP/sft_lora_train_shared_eval.py \
 
   
 # re
-DATASET="dolly" OUT_DIR="data/dolly/exp4.7.1/run_dolly_recipe_130" TRAIN_SIZE=130 EPOCHS=4 BATCH=1 GRAD_ACCUM=4 MAX_LEN=256 MAX_CAP_DIM=32 ANCHOR_SIZE=2 ANCHOR_CAP_REFRESH=2 ANCHOR_REFRESH=40 ANCHOR_CHUNK=2 RECIPE_UPDATE_INTERVAL=4 GAMMA_T=0.3 FREQ_PENALTY=0.01 STATIC_FLOOR_RATIO=0.3 UNIFORM_FLOOR_RATIO=0.01 TORCH_DTYPE=fp16 GRAD_CKPT=1 LOG_EVERY=1 SAVE_EVERY=0 bash src/4.3/run.sh
+python src/4.3/run_orchestrator.py \
+  --train-raw-jsonl data/dolly/train.jsonl \
+  --anchor-jsonl data/dolly/train.jsonl \
+  --topk-jsonl data/dolly/train_coarse_topk5.jsonl \
+  --score-path alpagasus_improved::data/dolly/score/alpagasus_improved_mapped.jsonl \
+  --score-path delta_improved::data/dolly/score/delta_improved_mapped.jsonl \
+  --score-path srm::data/dolly/score/srm_from_topk5_only.jsonl \
+  --score-path pdm::data/dolly/score/pdm_scored.jsonl \
+  --output-dir data/dolly/exp4.3/decoupled_run1 \
+  --base-model Qwen/Qwen2.5-0.5B \
+  --model-source modelscope \
+  --num-chunks 10 \
+  --total-epochs 4 \
+  --anchor-size-per-cap 2 \
+  --anchor-batch-size 2 \
+  --max-seq-length 256 \
+  --train-batch-size 1 \
+  --gradient-accumulation-steps 4 \
+  --keep-policy threshold \
+  --keep-threshold 0.5 \
+  --alpha-ema 0.1 \
+  --beta-ema 0.2 \
+  --shared-eval-jsonl data/dolly/test.jsonl \
+  --run-static-stage 1 \
+  --seed 42
+
 
 
 # EM评估
