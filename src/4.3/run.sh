@@ -5,6 +5,7 @@ set -euo pipefail
 #   bash src/4.3/run.sh
 # Optional overrides:
 #   STEPS=300 BATCH=8 GRAD_ACCUM=2 ANCHOR_REFRESH=20 MAX_CAP_DIM=128 MAX_SAMPLES=0 bash src/4.3/run.sh
+#   LORA_TARGET_MODULES=all-linear  # align with src/4.1/EXP/sft_lora_train_shared_eval.py
 # Notes:
 #   Effective train batch ~= BATCH * GRAD_ACCUM (GRAD_ACCUM 次独立采样后再统一 optimizer.step)。
 
@@ -37,6 +38,7 @@ PRUNE_REWARD_THRESHOLD="${PRUNE_REWARD_THRESHOLD:--0.05}"
 LORA_R="${LORA_R:-8}"
 LORA_ALPHA="${LORA_ALPHA:-16}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
+LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-all-linear}"
 DRY_RUN="${DRY_RUN:-0}"
 
 
@@ -73,6 +75,7 @@ CMD=(
   --lora-r "$LORA_R"
   --lora-alpha "$LORA_ALPHA"
   --lora-dropout "$LORA_DROPOUT"
+  --lora-target-modules "$LORA_TARGET_MODULES"
   --log-every 5
   --save-every 50
   --seed 42

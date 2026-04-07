@@ -145,8 +145,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--lora-target-modules",
         type=str,
-        default="q_proj,k_proj,v_proj,o_proj,up_proj,gate_proj,down_proj",
-        help="Comma-separated module names.",
+        default="all-linear",
+        help=(
+            "LoRA target modules. "
+            "Use 'all-linear' to match 4.1 script scope, or pass comma-separated module names."
+        ),
     )
 
     # Logging/checkpoints
@@ -515,9 +518,17 @@ def maybe_apply_lora(model: nn.Module, args: argparse.Namespace) -> nn.Module:
 
     from peft import LoraConfig, TaskType, get_peft_model
 
-    targets = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
-    if not targets:
+    raw_targets = str(args.lora_target_modules).strip()
+    if not raw_targets:
         raise ValueError("LoRA enabled but --lora-target-modules is empty.")
+    if raw_targets.lower() in {"all-linear", "all_linear"}:
+        # 与 4.1/EXP/sft_lora_train_shared_eval.py 保持一致。
+        targets: str | list[str] = "all-linear"
+    else:
+        parsed = [x.strip() for x in raw_targets.split(",") if x.strip()]
+        if not parsed:
+            raise ValueError("LoRA enabled but parsed --lora-target-modules is empty.")
+        targets = parsed
 
     lora_cfg = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
