@@ -807,8 +807,12 @@ class RecipeEvolver:
             self.gradient_dim,
         )
 
-        # g_{C_j} 缓存：形状 (m, gradient_dim)
-        self.anchor_grads = torch.zeros((self.m_caps, self.gradient_dim), dtype=torch.float32, device=self.device)
+        # g_{C_j} 缓存：
+        # - 不再预分配 (m, gradient_dim) 的大矩阵，避免显存/内存爆炸。
+        # - 按 capability 懒存储到 CPU：{cap_id: normalized_grad_vector}
+        self.anchor_grads: dict[int, torch.Tensor] = {}
+        # 阶段2使用的 ||g_{C_j}||_2（raw norm），在 CPU 维护即可。
+        self.anchor_grad_norms = torch.zeros((self.m_caps,), dtype=torch.float32, device="cpu")
 
         # capability -> 样本索引列表，用于锚点采样
         self.capability_to_samples = self._build_capability_index()
@@ -888,11 +892,22 @@ class RecipeEvolver:
 
         selected_refs = [p for p in unique_refs if p.requires_grad]
         if not selected_refs:
-            # 若目标层参数都冻结，仅为梯度反馈临时打开 requires_grad。
+            # 优先回退到全局可训练参数（典型是 LoRA 参数），避免直接使用冻结大矩阵导致 OOM。
+            fallback_trainable = [(n, p) for n, p in all_named_params_list if p.requires_grad]
+            if fallback_trainable:
+                logging.warning(
+                    "No trainable params under target layer %s; fallback to all trainable params.",
+                    chosen_prefix,
+                )
+                names = [n for n, _ in fallback_trainable]
+                refs = [p for _, p in fallback_trainable]
+                return names, refs
+
+            # 最后兜底：若全局也无可训练参数，只能临时打开目标层参数用于梯度反馈。
             selected_refs = unique_refs
             if selected_refs:
                 logging.warning(
-                    "No trainable params under target layer %s; enable requires_grad for feedback only.",
+                    "No trainable params in model; enable requires_grad under target layer %s for feedback only.",
                     chosen_prefix,
                 )
                 for p in selected_refs:
@@ -1006,13 +1021,13 @@ class RecipeEvolver:
         vec = torch.cat(flat, dim=0)
         return vec
 
-    def compute_anchor_gradients(self) -> torch.Tensor:
+    def compute_anchor_gradients(self) -> dict[int, torch.Tensor]:
         """阶段1：计算能力簇锚点梯度 g_{C_j}。
 
         实现逻辑：
         - 对每个能力簇 j，从该簇关联样本中采样 anchor_size 条。
         - 通过 extract_layer_gradients 只提取目标层梯度，并求均值作为 g_{C_j}。
-        - 结果缓存到 self.anchor_grads，形状 (m, gradient_dim)。
+        - 结果缓存到 self.anchor_grads（CPU 字典，按 capability 懒存储）。
         """
         # 选取这次要刷新的能力簇（可选子采样，降低开销）
         caps = [j for j, ids in enumerate(self.capability_to_samples) if ids]
@@ -1042,15 +1057,22 @@ class RecipeEvolver:
                     continue
 
                 cap_grad = torch.stack(chunk_vecs, dim=0).mean(dim=0)
-                cap_norm = cap_grad.norm().clamp_min(EPS)
-                self.anchor_grads[cap] = cap_grad / cap_norm
+                cap_norm = float(cap_grad.norm().item())
+                self.anchor_grad_norms[cap] = cap_norm
+                if cap_norm <= EPS:
+                    # 梯度接近0时，不参与奖励匹配。
+                    if cap in self.anchor_grads:
+                        del self.anchor_grads[cap]
+                    continue
+                # 归一化后缓存到 CPU，显著降低显存占用。
+                self.anchor_grads[cap] = (cap_grad / cap_norm).detach().to(torch.float16).cpu()
 
         return self.anchor_grads
 
     def update_beta(self) -> torch.Tensor:
         """阶段2：基于锚点梯度范数更新 beta，并做 L1 归一化。"""
         with torch.no_grad():
-            norms = self.anchor_grads.norm(dim=1)  # (m,)
+            norms = self.anchor_grad_norms.to(self.device)  # (m,)
             denom = norms.sum().clamp_min(EPS)
             delta = self.eta_beta * (norms / denom)
             self.beta = self.beta + delta
@@ -1161,20 +1183,30 @@ class RecipeEvolver:
 
         idx_cpu = torch.tensor(batch_indices, dtype=torch.long)
         topk_cpu = self.top_k_indices_cpu.index_select(0, idx_cpu)  # (B, K)
-        topk = topk_cpu.to(self.device)
 
-        safe_topk = topk.clamp_min(0)
-        anchor = self.anchor_grads.index_select(0, safe_topk.view(-1)).view(topk.size(0), topk.size(1), -1)
+        gx = per_sample_grads / per_sample_grads.norm(dim=1, keepdim=True).clamp_min(EPS)  # (B, D)
+        bsz = int(topk_cpu.size(0))
 
-        # cosine(sim) = dot(g_x, g_Cj) / (||g_x|| * ||g_Cj||)
-        gx = per_sample_grads / per_sample_grads.norm(dim=1, keepdim=True).clamp_min(EPS)
-        anchor_norm = anchor.norm(dim=2)
-        dot = torch.einsum("bkd,bd->bk", anchor, gx)
-        denom = anchor_norm * gx.norm(dim=1, keepdim=True).clamp_min(EPS)
-        sim = dot / denom.clamp_min(EPS)
+        reward_sum = torch.zeros((bsz,), dtype=torch.float32, device=self.device)
+        reward_count = torch.zeros((bsz,), dtype=torch.float32, device=self.device)
+        anchor_cache: dict[int, torch.Tensor] = {}
 
-        valid_mask = (topk >= 0) & (anchor_norm > 0)
-        reward = (sim * valid_mask.to(sim.dtype)).sum(dim=1) / valid_mask.sum(dim=1).clamp_min(1).to(sim.dtype)
+        # 这里 B 和 K 通常较小（如 B<=8, K<=5），循环开销可接受，避免构建巨型中间张量。
+        for b in range(bsz):
+            for cap in topk_cpu[b].tolist():
+                if cap < 0:
+                    continue
+                vec_cpu = self.anchor_grads.get(int(cap))
+                if vec_cpu is None:
+                    continue
+                if cap not in anchor_cache:
+                    anchor_cache[cap] = vec_cpu.to(self.device, dtype=torch.float32, non_blocking=True)
+                g_cap = anchor_cache[cap]
+                sim = torch.dot(gx[b], g_cap) / g_cap.norm().clamp_min(EPS)
+                reward_sum[b] += sim
+                reward_count[b] += 1.0
+
+        reward = reward_sum / reward_count.clamp_min(1.0)
         return reward
 
     def update_alpha(self, batch_indices: list[int], rewards: torch.Tensor) -> torch.Tensor:
