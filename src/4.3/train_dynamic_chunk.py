@@ -65,6 +65,7 @@ class DynamicSelectorState:
     beta: torch.Tensor  # (M,), CPU float32
     alpha: torch.Tensor  # (K,), CPU float32
     anchor_grads: dict[int, torch.Tensor]  # cap -> (D,), CPU float32 normalized
+    grad_dim: int
 
     alpha_ema: float
     alpha_temperature: float
@@ -125,11 +126,21 @@ class DynamicChunkTrainer(SFTTrainer):
             allow_unused=True,
         )
         parts: list[torch.Tensor] = []
+        remaining = int(self.selector_state.grad_dim)
         for g, (_, p) in zip(grads, self.grad_params):
+            if remaining <= 0:
+                break
+            take = min(int(p.numel()), remaining)
+            if take <= 0:
+                continue
             if g is None:
-                parts.append(torch.zeros((p.numel(),), dtype=torch.float32, device=loss_scalar.device))
+                parts.append(torch.zeros((take,), dtype=torch.float32, device=loss_scalar.device))
             else:
-                parts.append(g.detach().to(torch.float32).reshape(-1))
+                flat = g.detach().to(torch.float32).reshape(-1)
+                parts.append(flat[:take])
+            remaining -= take
+        if not parts:
+            return torch.zeros((1,), dtype=torch.float32, device=loss_scalar.device)
         gvec = torch.cat(parts, dim=0)
         return gvec / gvec.norm().clamp_min(EPS)
 
@@ -154,9 +165,14 @@ class DynamicChunkTrainer(SFTTrainer):
             if cap not in self._anchor_device_cache:
                 self._anchor_device_cache[cap] = g_cap_cpu.to(device=device, dtype=torch.float32)
             g_cap = self._anchor_device_cache[cap]
+            dim = min(int(sample_grad.numel()), int(g_cap.numel()))
+            if dim <= 0:
+                continue
+            sg = sample_grad[:dim]
+            g_cap = g_cap[:dim]
             g_cap = g_cap / g_cap.norm().clamp_min(EPS)
 
-            sim = torch.dot(sample_grad, g_cap)
+            sim = torch.dot(sg, g_cap)
             w = beta[cap] if cap < beta.numel() else torch.tensor(0.0, device=device)
             if w.item() <= 0:
                 continue
@@ -340,6 +356,12 @@ def parse_args() -> argparse.Namespace:
         default="lora",
     )
     parser.add_argument("--grad-param-filter", type=str, default="")
+    parser.add_argument(
+        "--max-grad-dim",
+        type=int,
+        default=65536,
+        help="Truncate flattened sample gradient vector to first N dims. 0 means full anchor dim.",
+    )
 
     parser.add_argument("--torch-dtype", type=str, choices=["auto", "fp32", "fp16", "bf16"], default="auto")
     parser.add_argument("--grad-ckpt", type=int, default=1)
@@ -549,12 +571,13 @@ def load_alpha(alpha_json: Path, k_methods: int) -> torch.Tensor:
     return torch.full((k_methods,), 1.0 / float(k_methods), dtype=torch.float32)
 
 
-def load_anchor_grads(anchor_grads_path: Path) -> tuple[dict[int, torch.Tensor], int]:
+def load_anchor_grads(anchor_grads_path: Path) -> tuple[dict[int, torch.Tensor], int, int]:
     if not anchor_grads_path.exists():
         raise FileNotFoundError(f"anchor_grads not found: {anchor_grads_path}")
     obj = torch.load(anchor_grads_path, map_location="cpu")
     grads_obj = obj.get("grads", {})
     m_dim = int(obj.get("m_dim", 0))
+    grad_dim = int(obj.get("gradient_dim", 0))
 
     out: dict[int, torch.Tensor] = {}
     if isinstance(grads_obj, dict):
@@ -568,7 +591,9 @@ def load_anchor_grads(anchor_grads_path: Path) -> tuple[dict[int, torch.Tensor],
             vec = v.to(torch.float32).reshape(-1)
             n = vec.norm().clamp_min(EPS)
             out[cap] = vec / n
-    return out, m_dim
+            if grad_dim <= 0:
+                grad_dim = int(vec.numel())
+    return out, m_dim, grad_dim
 
 
 def select_grad_parameters(
@@ -773,7 +798,7 @@ def main() -> None:
         raise ValueError("chunk_jsonl is empty.")
 
     beta = load_beta(args.beta_json)
-    anchor_grads, anchor_m_dim = load_anchor_grads(args.anchor_grads)
+    anchor_grads, anchor_m_dim, anchor_grad_dim = load_anchor_grads(args.anchor_grads)
 
     mapper_names, method_scores, topk_tensor = build_score_tensor_bundle(
         chunk_rows=chunk_rows,
@@ -787,6 +812,30 @@ def main() -> None:
     k_methods = len(mapper_names)
     alpha = load_alpha(args.alpha_json, k_methods=k_methods)
 
+    effective_grad_dim = int(anchor_grad_dim)
+    if int(args.max_grad_dim) > 0:
+        effective_grad_dim = min(effective_grad_dim, int(args.max_grad_dim)) if effective_grad_dim > 0 else int(
+            args.max_grad_dim
+        )
+    if effective_grad_dim <= 0:
+        effective_grad_dim = int(args.max_grad_dim) if int(args.max_grad_dim) > 0 else 65536
+
+    # Align anchor vectors to effective dimension.
+    if anchor_grads:
+        trimmed: dict[int, torch.Tensor] = {}
+        for cap, vec in anchor_grads.items():
+            v = vec[:effective_grad_dim].to(torch.float32)
+            v = v / v.norm().clamp_min(EPS)
+            trimmed[int(cap)] = v
+        anchor_grads = trimmed
+
+    logging.info(
+        "Dynamic gradient dim: anchor_grad_dim=%d, configured_max_grad_dim=%d, effective_grad_dim=%d",
+        int(anchor_grad_dim),
+        int(args.max_grad_dim),
+        int(effective_grad_dim),
+    )
+
     selector_state = DynamicSelectorState(
         method_names=mapper_names,
         method_scores=method_scores,
@@ -794,6 +843,7 @@ def main() -> None:
         beta=beta,
         alpha=alpha,
         anchor_grads=anchor_grads,
+        grad_dim=int(effective_grad_dim),
         alpha_ema=float(args.alpha_ema),
         alpha_temperature=float(args.alpha_temperature),
         data_weight=float(args.data_weight),

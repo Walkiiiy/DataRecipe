@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from peft import PeftModel
+from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import AutoTokenizer
 
 from recipe_common import (
@@ -46,6 +46,12 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--anchor-jsonl", type=Path, required=True)
     parser.add_argument("--topk-jsonl", type=Path, default=None)
+    parser.add_argument(
+        "--focus-jsonl",
+        type=Path,
+        default=None,
+        help="Optional: restrict updated capabilities to those appearing in this chunk's top-k set.",
+    )
     parser.add_argument("--capability-key", type=str, default="auto")
     parser.add_argument("--anchor-size-per-cap", type=int, default=4)
     parser.add_argument("--anchor-batch-size", type=int, default=2)
@@ -56,6 +62,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--beta-ema", type=float, default=0.0, help="EMA on beta. 0 means disabled")
     parser.add_argument("--output-beta-json", type=Path, required=True)
     parser.add_argument("--output-anchor-grads", type=Path, required=True)
+    parser.add_argument("--lora-r", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.05)
 
     parser.add_argument(
         "--grad-param-mode",
@@ -64,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         default="lora",
     )
     parser.add_argument("--grad-param-filter", type=str, default="")
+    parser.add_argument(
+        "--max-grad-dim",
+        type=int,
+        default=65536,
+        help="Truncate flattened gradient vector to first N dims for memory safety. 0 means full.",
+    )
 
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -83,6 +98,7 @@ def load_model_from_checkpoint(
     model_source: str,
     modelscope_cache_dir: Path | None,
     dtype: torch.dtype,
+    lora_cfg: LoraConfig,
 ):
     resolved_base = resolve_model_path(base_model, model_source, modelscope_cache_dir)
 
@@ -94,6 +110,9 @@ def load_model_from_checkpoint(
 
     if ckpt_path.exists():
         model = load_causal_lm(str(ckpt_path), dtype=dtype)
+        has_lora = any("lora_" in n for n, _ in model.named_parameters())
+        if not has_lora:
+            model = get_peft_model(model, lora_cfg)
         return model, str(ckpt_path)
 
     # Non-local identifier branch.
@@ -107,10 +126,16 @@ def load_model_from_checkpoint(
             resolved_base,
         )
         model = load_causal_lm(resolved_base, dtype=dtype)
+        has_lora = any("lora_" in n for n, _ in model.named_parameters())
+        if not has_lora:
+            model = get_peft_model(model, lora_cfg)
         return model, resolved_base
 
     # Fallback: treat checkpoint path as generic model identifier.
     model = load_causal_lm(checkpoint_path, dtype=dtype)
+    has_lora = any("lora_" in n for n, _ in model.named_parameters())
+    if not has_lora:
+        model = get_peft_model(model, lora_cfg)
     return model, checkpoint_path
 
 
@@ -225,17 +250,48 @@ def select_grad_parameters(
     return [(n, p) for n, p in all_named if id(p) in selected_ids]
 
 
-def flatten_grads(grad_params: list[tuple[str, torch.nn.Parameter]]) -> torch.Tensor:
+def flatten_grads(
+    grad_params: list[tuple[str, torch.nn.Parameter]],
+    max_grad_dim: int,
+) -> torch.Tensor:
     parts: list[torch.Tensor] = []
+    remaining = int(max_grad_dim) if int(max_grad_dim) > 0 else None
+
     for _, p in grad_params:
+        if remaining is not None and remaining <= 0:
+            break
+
         g = p.grad
+        take = p.numel() if remaining is None else min(p.numel(), remaining)
+        if take <= 0:
+            continue
+
         if g is None:
-            parts.append(torch.zeros((p.numel(),), dtype=torch.float32, device=p.device))
+            parts.append(torch.zeros((take,), dtype=torch.float32, device=p.device))
         else:
-            parts.append(g.detach().to(torch.float32).reshape(-1))
+            flat = g.detach().to(torch.float32).reshape(-1)
+            parts.append(flat[:take])
+
+        if remaining is not None:
+            remaining -= take
+
     if not parts:
         return torch.zeros((1,), dtype=torch.float32)
     return torch.cat(parts, dim=0)
+
+
+def collect_focus_caps(
+    focus_rows: list[dict[str, Any]],
+    topk_map: dict[str, list[int]],
+) -> set[int]:
+    caps: set[int] = set()
+    for i, row in enumerate(focus_rows):
+        rid = choose_row_id(row, i)
+        vals = topk_map.get(rid, [])
+        for c in vals:
+            if c >= 0:
+                caps.add(int(c))
+    return caps
 
 
 def collate_anchor_batch(
@@ -306,12 +362,22 @@ def main() -> None:
     if device.type == "cpu" and dtype != torch.float32:
         dtype = torch.float32
 
+    lora_cfg = LoraConfig(
+        r=max(1, args.lora_r),
+        lora_alpha=max(1, args.lora_alpha),
+        lora_dropout=max(0.0, args.lora_dropout),
+        target_modules="all-linear",
+        bias="none",
+        task_type=TaskType.CAUSAL_LM,
+    )
+
     model, tokenizer_source = load_model_from_checkpoint(
         checkpoint_path=args.checkpoint_path,
         base_model=args.base_model,
         model_source=args.model_source,
         modelscope_cache_dir=args.modelscope_cache_dir,
         dtype=dtype,
+        lora_cfg=lora_cfg,
     )
     model.to(device)
     model.train()
@@ -325,7 +391,12 @@ def main() -> None:
         raise RuntimeError("No target gradient parameters found.")
 
     grad_dim = int(sum(p.numel() for _, p in grad_params))
-    logging.info("Selected %d gradient params, grad_dim=%d", len(grad_params), grad_dim)
+    logging.info(
+        "Selected %d gradient params, full_grad_dim=%d, max_grad_dim=%d",
+        len(grad_params),
+        grad_dim,
+        int(args.max_grad_dim),
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -339,6 +410,25 @@ def main() -> None:
         raise ValueError("No valid capability anchors found from anchor_jsonl.")
 
     caps = sorted(grouped.keys())
+    if args.focus_jsonl is not None:
+        if not args.focus_jsonl.exists():
+            raise FileNotFoundError(f"focus_jsonl not found: {args.focus_jsonl}")
+        focus_rows = load_jsonl(args.focus_jsonl)
+        focus_caps = collect_focus_caps(focus_rows, topk_map=topk_map)
+        if focus_caps:
+            caps = [c for c in caps if c in focus_caps]
+            logging.info(
+                "Focus mode enabled by %s: focus_caps=%d, intersected_caps=%d",
+                args.focus_jsonl,
+                len(focus_caps),
+                len(caps),
+            )
+        else:
+            logging.warning(
+                "focus_jsonl=%s produced empty focus caps; fallback to full grouped capabilities.",
+                args.focus_jsonl,
+            )
+
     if args.max_capabilities > 0 and len(caps) > args.max_capabilities:
         random.shuffle(caps)
         caps = sorted(caps[: args.max_capabilities])
@@ -370,7 +460,7 @@ def main() -> None:
                 labels=batch["labels"],
             )
             out.loss.backward()
-            cap_vecs.append(flatten_grads(grad_params))
+            cap_vecs.append(flatten_grads(grad_params, max_grad_dim=int(args.max_grad_dim)))
 
         if not cap_vecs:
             continue
@@ -440,7 +530,8 @@ def main() -> None:
             "grads": {int(k): v for k, v in anchor_grads.items()},
             "norms": {int(k): float(v) for k, v in anchor_norms.items()},
             "m_dim": int(m_dim),
-            "gradient_dim": int(grad_dim),
+            "gradient_dim": int(next(iter(anchor_grads.values())).numel()) if anchor_grads else 0,
+            "gradient_dim_full": int(grad_dim),
             "target_param_names": [name for name, _ in grad_params],
             "checkpoint_path": args.checkpoint_path,
         },

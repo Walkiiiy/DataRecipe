@@ -60,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-anchor-capabilities", type=int, default=0)
     parser.add_argument("--beta-ema", type=float, default=0.0)
     parser.add_argument(
+        "--focus-anchor-by-chunk",
+        type=int,
+        default=1,
+        help="1: module2 only refresh capabilities appearing in current chunk top-k.",
+    )
+    parser.add_argument(
         "--beta-grad-param-mode",
         type=str,
         choices=["lora", "lm_head", "all_trainable", "name_contains"],
@@ -96,6 +102,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--chunk-grad-param-filter", type=str, default="")
     parser.add_argument("--grad-ckpt", type=int, default=1)
+    parser.add_argument(
+        "--max-grad-dim",
+        type=int,
+        default=65536,
+        help="Truncate flattened gradients in module1/2 for memory safety. 0 means full dim.",
+    )
 
     # static stage config
     parser.add_argument("--run-static-stage", type=int, default=1)
@@ -260,6 +272,14 @@ def main() -> None:
             str(args.max_anchor_capabilities),
             "--beta-ema",
             str(args.beta_ema),
+            "--lora-r",
+            str(args.lora_r),
+            "--lora-alpha",
+            str(args.lora_alpha),
+            "--lora-dropout",
+            str(args.lora_dropout),
+            "--max-grad-dim",
+            str(args.max_grad_dim),
             "--output-beta-json",
             str(beta_json),
             "--output-anchor-grads",
@@ -277,6 +297,8 @@ def main() -> None:
             cmd_m2.extend(["--modelscope-cache-dir", str(args.modelscope_cache_dir)])
         if beta_json.exists():
             cmd_m2.extend(["--prev-beta-json", str(beta_json)])
+        if int(args.focus_anchor_by_chunk) == 1:
+            cmd_m2.extend(["--focus-jsonl", str(chunk_file)])
 
         run_cmd(cmd_m2)
 
@@ -351,6 +373,8 @@ def main() -> None:
             args.chunk_grad_param_mode,
             "--grad-param-filter",
             args.chunk_grad_param_filter,
+            "--max-grad-dim",
+            str(args.max_grad_dim),
             "--grad-ckpt",
             str(args.grad_ckpt),
             "--seed",
