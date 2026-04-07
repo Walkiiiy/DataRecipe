@@ -191,6 +191,8 @@ class DynamicChunkTrainer(SFTTrainer):
         bsz = int(final_scores.numel())
         if bsz == 0:
             return torch.zeros((0,), dtype=torch.bool, device=final_scores.device)
+        if bsz == 1:
+            return torch.ones((1,), dtype=torch.bool, device=final_scores.device)
 
         if self.selector_state.keep_policy == "softmax":
             k = max(1, int(round(bsz * self.selector_state.keep_ratio)))
@@ -204,7 +206,7 @@ class DynamicChunkTrainer(SFTTrainer):
 
         # threshold policy
         centered = final_scores - final_scores.mean()
-        scaled = centered / final_scores.std().clamp_min(1e-6)
+        scaled = centered / final_scores.std(unbiased=False).clamp_min(1e-6)
         probs = torch.sigmoid(scaled)
         keep = probs >= self.selector_state.keep_threshold
 
@@ -234,17 +236,18 @@ class DynamicChunkTrainer(SFTTrainer):
         sample_ids = inputs.pop("sample_ids")
         labels = inputs["labels"]
 
-        outputs = model(**inputs)
-        per_sample_loss = self._per_sample_response_loss(outputs.logits, labels)
+        # Pass-1: selection graph (used only for sample-gradient probing).
+        outputs_select = model(**inputs)
+        per_sample_loss_select = self._per_sample_response_loss(outputs_select.logits, labels)
 
-        bsz = int(per_sample_loss.size(0))
-        device = per_sample_loss.device
+        bsz = int(per_sample_loss_select.size(0))
+        device = per_sample_loss_select.device
 
         # 1) Per-sample gradient interception
         sample_grads: list[torch.Tensor] = []
         for i in range(bsz):
             retain = i < (bsz - 1)
-            gvec = self._flatten_single_grad(per_sample_loss[i], retain_graph=retain)
+            gvec = self._flatten_single_grad(per_sample_loss_select[i], retain_graph=retain)
             sample_grads.append(gvec)
         grad_mat = torch.stack(sample_grads, dim=0) if sample_grads else torch.zeros((0, 1), device=device)
 
@@ -286,12 +289,16 @@ class DynamicChunkTrainer(SFTTrainer):
         # 4) Final S(x), keep/drop mask, and weighted loss
         final_score = self.selector_state.data_weight * data_score + self.selector_state.reward_weight * reward_scaled
         keep_mask = self._decide_keep_mask(final_score)
-        keep_weight = keep_mask.to(per_sample_loss.dtype)
+        keep_weight = keep_mask.to(torch.float32)
 
+        # Pass-2: training graph (clean graph for actual optimizer backward).
+        outputs_train = model(**inputs)
+        per_sample_loss_train = self._per_sample_response_loss(outputs_train.logits, labels)
+        keep_weight = keep_weight.to(per_sample_loss_train.dtype)
         if float(keep_weight.sum().item()) > 0:
-            final_loss = (per_sample_loss * keep_weight).sum() / keep_weight.sum().clamp_min(1.0)
+            final_loss = (per_sample_loss_train * keep_weight).sum() / keep_weight.sum().clamp_min(1.0)
         else:
-            final_loss = outputs.loss * 0.0
+            final_loss = outputs_train.loss * 0.0
 
         # 5) Online alpha update (EMA)
         self._update_alpha(mapper_util=mapper_util.detach(), reward_scaled=reward_scaled.detach())
@@ -303,7 +310,7 @@ class DynamicChunkTrainer(SFTTrainer):
                 self.selector_state.kept_local_indices.append(int(sid))
 
         if return_outputs:
-            return final_loss, outputs
+            return final_loss, outputs_train
         return final_loss
 
 
