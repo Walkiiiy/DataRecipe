@@ -949,6 +949,110 @@ class RecipeEvolver:
             if was_training:
                 self.model.train()
 
+    def _collect_wrapped_model_objects(self) -> list[Any]:
+        """递归收集 PEFT/Transformers 包装链对象。"""
+        out: list[Any] = []
+        seen: set[int] = set()
+        stack: list[Any] = [self.model]
+        while stack:
+            obj = stack.pop()
+            if obj is None:
+                continue
+            oid = id(obj)
+            if oid in seen:
+                continue
+            seen.add(oid)
+            out.append(obj)
+            for attr in ("model", "base_model", "module"):
+                nxt = getattr(obj, attr, None)
+                if nxt is not None and id(nxt) not in seen:
+                    stack.append(nxt)
+        return out
+
+    @contextmanager
+    def _suspend_input_require_grads_hook(self):
+        """在 functorch(vmap/grad) 区间临时关闭 input-require-grad hook。
+
+        背景：transformers 的 make_inputs_require_grads 在 forward 内会调用
+        Tensor.requires_grad_()，与 functorch transform 不兼容。
+        """
+        restore_states: list[tuple[Any, bool, bool]] = []
+        # tuple: (obj, had_grad_ckpt_enabled, had_input_grad_hook)
+        removed_module_hooks: list[tuple[torch.nn.Module, Any]] = []
+
+        for obj in self._collect_wrapped_model_objects():
+            had_gc = bool(getattr(obj, "is_gradient_checkpointing", False))
+            had_hook = getattr(obj, "_require_grads_hook", None) is not None
+            if not had_gc and not had_hook:
+                continue
+
+            # 先尽量关闭 gradient checkpointing，避免其 forward 里重建输入梯度 hook。
+            if had_gc and hasattr(obj, "gradient_checkpointing_disable"):
+                try:
+                    obj.gradient_checkpointing_disable()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # 直接移除 hook，避免 wrapper 实现差异导致 disable_input_require_grads 失效。
+            hook = getattr(obj, "_require_grads_hook", None)
+            if hook is not None:
+                try:
+                    hook.remove()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    setattr(obj, "_require_grads_hook", None)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            # 某些对象有专门 API，再补一层调用确保状态一致。
+            if hasattr(obj, "disable_input_require_grads"):
+                try:
+                    obj.disable_input_require_grads()
+                except Exception:  # noqa: BLE001
+                    pass
+
+            restore_states.append((obj, had_gc, had_hook))
+
+        # 兜底：直接从模块 forward hooks 中移除 make_inputs_require_grads
+        # （某些包装路径下 hook 可能未通过 _require_grads_hook 暴露）。
+        for module in self.model.modules():
+            hooks = getattr(module, "_forward_hooks", None)
+            if not hooks:
+                continue
+            remove_keys: list[Any] = []
+            for key, hook_fn in hooks.items():
+                hook_name = getattr(hook_fn, "__name__", "")
+                hook_qual = getattr(hook_fn, "__qualname__", "")
+                if hook_name == "make_inputs_require_grads" or "make_inputs_require_grads" in hook_qual:
+                    removed_module_hooks.append((module, hook_fn))
+                    remove_keys.append(key)
+            for key in remove_keys:
+                hooks.pop(key, None)
+        try:
+            yield
+        finally:
+            # 先恢复模块级 hooks，再恢复对象状态。
+            for module, hook_fn in removed_module_hooks:
+                try:
+                    module.register_forward_hook(hook_fn)
+                except Exception:  # noqa: BLE001
+                    pass
+
+            for obj, had_gc, had_hook in restore_states:
+                # 恢复 gradient checkpointing 状态
+                if had_gc and hasattr(obj, "gradient_checkpointing_enable"):
+                    try:
+                        obj.gradient_checkpointing_enable()
+                    except Exception:  # noqa: BLE001
+                        pass
+                # 对原本存在输入梯度 hook 但未开启 grad_ckpt 的对象，恢复 hook
+                elif had_hook and hasattr(obj, "enable_input_require_grads"):
+                    try:
+                        obj.enable_input_require_grads()
+                    except Exception:  # noqa: BLE001
+                        pass
+
     def _to_device_batch(self, cpu_batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
             "input_ids": cpu_batch["input_ids"].to(self.device, non_blocking=True),
@@ -1146,33 +1250,35 @@ class RecipeEvolver:
         outputs: list[torch.Tensor] = []
 
         # 分块 vmap，避免一次性内存峰值过高
-        for st in range(0, batch_size, self.vmap_chunk_size):
-            ed = min(batch_size, st + self.vmap_chunk_size)
-            chunk_input_ids = batch["input_ids"][st:ed]
-            chunk_attention = batch["attention_mask"][st:ed]
-            chunk_labels = batch["labels"][st:ed]
+        # 这里临时关闭 input-require-grad hook，规避 functorch 冲突。
+        with self._suspend_input_require_grads_hook():
+            for st in range(0, batch_size, self.vmap_chunk_size):
+                ed = min(batch_size, st + self.vmap_chunk_size)
+                chunk_input_ids = batch["input_ids"][st:ed]
+                chunk_attention = batch["attention_mask"][st:ed]
+                chunk_labels = batch["labels"][st:ed]
 
-            grad_tree = vmap(grad_fn, in_dims=(None, 0, 0, 0))(
-                layer_params,
-                chunk_input_ids,
-                chunk_attention,
-                chunk_labels,
-            )
+                grad_tree = vmap(grad_fn, in_dims=(None, 0, 0, 0))(
+                    layer_params,
+                    chunk_input_ids,
+                    chunk_attention,
+                    chunk_labels,
+                )
 
-            flat_parts: list[torch.Tensor] = []
-            chunk_bsz = ed - st
-            for name, ref in zip(self.target_param_names, self.target_param_refs):
-                g = grad_tree.get(name)
-                if g is None:
-                    flat_parts.append(
-                        torch.zeros((chunk_bsz, ref.numel()), dtype=torch.float32, device=self.device)
-                    )
-                else:
-                    flat_parts.append(g.reshape(chunk_bsz, -1).to(torch.float32))
+                flat_parts: list[torch.Tensor] = []
+                chunk_bsz = ed - st
+                for name, ref in zip(self.target_param_names, self.target_param_refs):
+                    g = grad_tree.get(name)
+                    if g is None:
+                        flat_parts.append(
+                            torch.zeros((chunk_bsz, ref.numel()), dtype=torch.float32, device=self.device)
+                        )
+                    else:
+                        flat_parts.append(g.reshape(chunk_bsz, -1).to(torch.float32))
 
-            chunk_flat = torch.cat(flat_parts, dim=1)
-            chunk_flat = chunk_flat / chunk_flat.norm(dim=1, keepdim=True).clamp_min(EPS)
-            outputs.append(chunk_flat)
+                chunk_flat = torch.cat(flat_parts, dim=1)
+                chunk_flat = chunk_flat / chunk_flat.norm(dim=1, keepdim=True).clamp_min(EPS)
+                outputs.append(chunk_flat)
 
         return torch.cat(outputs, dim=0)
 
