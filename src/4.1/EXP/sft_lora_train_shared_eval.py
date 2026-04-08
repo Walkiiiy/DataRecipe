@@ -26,7 +26,7 @@ from typing import Any
 
 import torch
 from datasets import Dataset
-from peft import LoraConfig
+from peft import LoraConfig, PeftModel
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -62,6 +62,7 @@ class TrainConfig:
     base_model: str
     model_source: str
     modelscope_cache_dir: Path | None
+    init_adapter_checkpoint: Path | None
     max_seq_length: int
     learning_rate: float
     train_batch_size: int
@@ -122,6 +123,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base_model", type=str, default="Qwen/Qwen2.5-0.5B")
     parser.add_argument("--model_source", type=str, choices=["modelscope", "hf"], default="modelscope")
     parser.add_argument("--modelscope_cache_dir", type=Path, default=None)
+    parser.add_argument(
+        "--init_adapter_checkpoint",
+        type=Path,
+        default=None,
+        help="可选：LoRA adapter checkpoint。若提供，则在 base model 上加载该 adapter 并继续训练。",
+    )
     parser.add_argument("--max_seq_length", type=int, default=1024)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--train_batch_size", type=int, default=2)
@@ -456,7 +463,7 @@ def build_sft_trainer(
     tokenizer,
     train_ds: Dataset,
     eval_ds: Dataset,
-    peft_cfg: LoraConfig,
+    peft_cfg: LoraConfig | None,
     train_args: TrainingArguments,
     max_seq_length: int,
 ):
@@ -468,10 +475,11 @@ def build_sft_trainer(
         "model": model,
         "train_dataset": train_ds,
         "eval_dataset": eval_ds,
-        "peft_config": peft_cfg,
         "args": train_args,
         "callbacks": [EvalLossCallback()],
     }
+    if peft_cfg is not None:
+        kwargs["peft_config"] = peft_cfg
     if "tokenizer" in params:
         kwargs["tokenizer"] = tokenizer
     elif "processing_class" in params:
@@ -544,6 +552,21 @@ def train_one_method(
         bias="none",
         task_type="CAUSAL_LM",
     )
+    trainer_peft_cfg: LoraConfig | None = peft_cfg
+    resumed_from_adapter: str | None = None
+    if cfg.init_adapter_checkpoint is not None:
+        adapter_path = cfg.init_adapter_checkpoint
+        if not adapter_path.exists():
+            raise FileNotFoundError(f"init_adapter_checkpoint not found: {adapter_path}")
+        if not (adapter_path / "adapter_config.json").exists():
+            raise FileNotFoundError(
+                f"init_adapter_checkpoint is not a valid LoRA adapter directory: {adapter_path}"
+            )
+        model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=True)
+        trainer_peft_cfg = None
+        resumed_from_adapter = str(adapter_path)
+        logging.info("[%s] Resume LoRA adapter from: %s", job.name, adapter_path)
+
     cfg_for_run = TrainConfig(**{**cfg.__dict__, "eval_steps": resolved_eval_steps})
     train_args = build_training_args(cfg_for_run, job.output_dir)
     trainer = build_sft_trainer(
@@ -551,7 +574,7 @@ def train_one_method(
         tokenizer=tokenizer,
         train_ds=train_ds,
         eval_ds=eval_ds,
-        peft_cfg=peft_cfg,
+        peft_cfg=trainer_peft_cfg,
         train_args=train_args,
         max_seq_length=cfg.max_seq_length,
     )
@@ -586,6 +609,7 @@ def train_one_method(
         "resolved_eval_steps": resolved_eval_steps,
         "best_checkpoint": best_ckpt,
         "best_eval_loss": best_eval_loss,
+        "resumed_from_adapter": resumed_from_adapter,
         "final_metrics": final_metrics,
     }
 
@@ -621,6 +645,7 @@ def main() -> None:
         base_model=args.base_model,
         model_source=args.model_source,
         modelscope_cache_dir=args.modelscope_cache_dir,
+        init_adapter_checkpoint=args.init_adapter_checkpoint,
         max_seq_length=max(128, args.max_seq_length),
         learning_rate=args.learning_rate,
         train_batch_size=max(1, args.train_batch_size),
@@ -662,6 +687,8 @@ def main() -> None:
 
     logging.info("Shared eval path=%s, size=%d", shared_eval_path, len(eval_ds))
     logging.info("Runs=%s", [r.name for r in cfg.runs])
+    if cfg.init_adapter_checkpoint is not None:
+        logging.info("Init adapter checkpoint=%s", cfg.init_adapter_checkpoint)
 
     model_path = resolve_model_path(cfg.base_model, cfg.model_source, cfg.modelscope_cache_dir)
     logging.info("Model resolved from %s: %s", cfg.model_source, model_path)
@@ -696,6 +723,7 @@ def main() -> None:
                 "target_eval_count": cfg.target_eval_count,
                 "min_eval_steps": cfg.min_eval_steps,
                 "runs": [r.name for r in cfg.runs],
+                "init_adapter_checkpoint": str(cfg.init_adapter_checkpoint) if cfg.init_adapter_checkpoint else None,
                 "jobs": summary,
             },
             f,

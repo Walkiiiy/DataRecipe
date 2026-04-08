@@ -77,6 +77,11 @@ class DynamicSelectorState:
     keep_threshold: float
     keep_ratio: float
     softmax_temperature: float
+    score_ema_mean: float
+    score_ema_var: float
+    score_ema_momentum: float
+    min_keep_prob: float
+    keep_every_n: int
 
     kept_local_indices: list[int]
     seen_kept: set[int]
@@ -96,6 +101,7 @@ class DynamicChunkTrainer(SFTTrainer):
         self.selector_state = selector_state
         self.grad_params = grad_params
         self._anchor_device_cache: dict[int, torch.Tensor] = {}
+        self._dynamic_step = 0
 
     @staticmethod
     def _per_sample_response_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -191,8 +197,28 @@ class DynamicChunkTrainer(SFTTrainer):
         bsz = int(final_scores.numel())
         if bsz == 0:
             return torch.zeros((0,), dtype=torch.bool, device=final_scores.device)
+
+        # Single-sample micro-batch needs a dedicated policy. If we always keep
+        # at B=1, dynamic selection degenerates (selected_ratio -> 1.0).
         if bsz == 1:
-            return torch.ones((1,), dtype=torch.bool, device=final_scores.device)
+            if self.selector_state.keep_policy == "softmax":
+                p = max(float(self.selector_state.min_keep_prob), float(self.selector_state.keep_ratio))
+                keep_flag = random.random() < p
+            else:
+                s = float(final_scores[0].detach().item())
+                mean = float(self.selector_state.score_ema_mean)
+                var = max(float(self.selector_state.score_ema_var), 1e-8)
+                std = max(math.sqrt(var), 1e-6)
+                z = (s - mean) / std
+                p = 1.0 / (1.0 + math.exp(-z))
+                p = 0.7 * p + 0.3 * float(self.selector_state.keep_ratio)
+                p = max(float(self.selector_state.min_keep_prob), min(1.0, p))
+                keep_flag = random.random() < p
+
+            keep_every_n = int(max(0, self.selector_state.keep_every_n))
+            if (not keep_flag) and keep_every_n > 0 and (self._dynamic_step % keep_every_n == 0):
+                keep_flag = True
+            return torch.tensor([keep_flag], dtype=torch.bool, device=final_scores.device)
 
         if self.selector_state.keep_policy == "softmax":
             k = max(1, int(round(bsz * self.selector_state.keep_ratio)))
@@ -232,6 +258,7 @@ class DynamicChunkTrainer(SFTTrainer):
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):  # noqa: D401
         del num_items_in_batch
+        self._dynamic_step += 1
 
         sample_ids = inputs.pop("sample_ids")
         labels = inputs["labels"]
@@ -288,6 +315,17 @@ class DynamicChunkTrainer(SFTTrainer):
 
         # 4) Final S(x), keep/drop mask, and weighted loss
         final_score = self.selector_state.data_weight * data_score + self.selector_state.reward_weight * reward_scaled
+
+        # Update running score statistics (used by B=1 keep policy).
+        s_mean = float(final_score.detach().mean().item())
+        mom = float(min(max(self.selector_state.score_ema_momentum, 1e-4), 1.0))
+        old_mean = float(self.selector_state.score_ema_mean)
+        new_mean = (1.0 - mom) * old_mean + mom * s_mean
+        centered = float(((final_score.detach() - new_mean) ** 2).mean().item())
+        new_var = (1.0 - mom) * float(self.selector_state.score_ema_var) + mom * centered
+        self.selector_state.score_ema_mean = new_mean
+        self.selector_state.score_ema_var = max(new_var, 1e-8)
+
         keep_mask = self._decide_keep_mask(final_score)
         keep_weight = keep_mask.to(torch.float32)
 
@@ -350,11 +388,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-threshold", type=float, default=0.5)
     parser.add_argument("--keep-ratio", type=float, default=0.5)
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
+    parser.add_argument("--score-ema-momentum", type=float, default=0.02)
+    parser.add_argument("--min-keep-prob", type=float, default=0.05)
+    parser.add_argument("--keep-every-n", type=int, default=32)
 
     parser.add_argument("--reward-weight", type=float, default=0.5)
     parser.add_argument("--data-weight", type=float, default=0.5)
     parser.add_argument("--alpha-ema", type=float, default=0.1)
     parser.add_argument("--alpha-temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--min-response-tokens",
+        type=int,
+        default=4,
+        help="Drop sample if truncated sequence keeps fewer than this many response tokens.",
+    )
 
     parser.add_argument(
         "--grad-param-mode",
@@ -435,24 +482,80 @@ def build_tokenized_chunk_dataset(
     rows: list[dict[str, Any]],
     tokenizer,
     max_seq_length: int,
-) -> Dataset:
+    min_response_tokens: int,
+) -> tuple[Dataset, list[dict[str, Any]]]:
+    def _build_prompt_without_output(row: dict[str, Any]) -> str:
+        instruction = str(row.get("instruction", "")).strip()
+        inp = row.get("input")
+        inp = "" if inp is None else str(inp).strip()
+        if inp:
+            return (
+                "### Instruction:\n"
+                f"{instruction}\n\n"
+                "### Input:\n"
+                f"{inp}\n\n"
+                "### Response:\n"
+            )
+        return (
+            "### Instruction:\n"
+            f"{instruction}\n\n"
+            "### Response:\n"
+        )
+
     features: list[dict[str, Any]] = []
-    for i, row in enumerate(rows):
+    kept_rows: list[dict[str, Any]] = []
+    skipped_short = 0
+    skipped_empty = 0
+
+    for row in rows:
         text = build_prompt(row)
+        prompt_only = _build_prompt_without_output(row)
         enc = tokenizer(
             text,
             truncation=True,
             max_length=max_seq_length,
             add_special_tokens=True,
         )
+        prompt_ids = tokenizer(
+            prompt_only,
+            truncation=False,
+            add_special_tokens=True,
+        )["input_ids"]
+
+        full_ids = enc["input_ids"]
+        resp_tokens = max(0, len(full_ids) - min(len(full_ids), len(prompt_ids)))
+        if resp_tokens <= 0:
+            skipped_empty += 1
+            continue
+        if resp_tokens < max(1, int(min_response_tokens)):
+            skipped_short += 1
+            continue
+
+        local_idx = len(kept_rows)
+        kept_rows.append(row)
         features.append(
             {
-                "input_ids": enc["input_ids"],
+                "input_ids": full_ids,
                 "attention_mask": enc.get("attention_mask"),
-                "sample_id": int(i),
+                "sample_id": int(local_idx),
             }
         )
-    return Dataset.from_list(features)
+
+    if not features:
+        raise ValueError(
+            "No valid tokenized samples after response-token filtering. "
+            f"max_seq_length={max_seq_length}, min_response_tokens={min_response_tokens}."
+        )
+
+    logging.info(
+        "Tokenized chunk: kept=%d/%d, skipped_empty_response=%d, skipped_short_response=%d (min_response_tokens=%d)",
+        len(features),
+        len(rows),
+        skipped_empty,
+        skipped_short,
+        int(min_response_tokens),
+    )
+    return Dataset.from_list(features), kept_rows
 
 
 def load_topk_for_ids(topk_jsonl: Path, wanted_ids: set[str]) -> tuple[dict[str, list[int]], int]:
@@ -859,6 +962,11 @@ def main() -> None:
         keep_threshold=float(args.keep_threshold),
         keep_ratio=float(args.keep_ratio),
         softmax_temperature=float(args.softmax_temperature),
+        score_ema_mean=0.0,
+        score_ema_var=1.0,
+        score_ema_momentum=float(args.score_ema_momentum),
+        min_keep_prob=float(args.min_keep_prob),
+        keep_every_n=int(args.keep_every_n),
         kept_local_indices=[],
         seen_kept=set(),
     )
@@ -901,10 +1009,17 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    train_ds = build_tokenized_chunk_dataset(
+    if int(args.max_seq_length) <= 256:
+        logging.warning(
+            "max_seq_length=%d may truncate response heavily on dolly; consider >=512 for stable loss.",
+            int(args.max_seq_length),
+        )
+
+    train_ds, train_rows_effective = build_tokenized_chunk_dataset(
         rows=chunk_rows,
         tokenizer=tokenizer,
         max_seq_length=max(64, args.max_seq_length),
+        min_response_tokens=max(1, args.min_response_tokens),
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -922,7 +1037,7 @@ def main() -> None:
     trainer.train()
 
     selected_local = selector_state.kept_local_indices
-    selected_rows = [chunk_rows[i] for i in selected_local if 0 <= i < len(chunk_rows)]
+    selected_rows = [train_rows_effective[i] for i in selected_local if 0 <= i < len(train_rows_effective)]
 
     selected_path = args.output_dir / "chunk_selected.jsonl"
     write_jsonl(selected_rows, selected_path)
@@ -937,8 +1052,10 @@ def main() -> None:
     result = {
         "chunk_jsonl": str(args.chunk_jsonl),
         "chunk_size": int(len(chunk_rows)),
+        "chunk_effective_size": int(len(train_rows_effective)),
         "selected_size": int(len(selected_rows)),
         "selected_ratio": float(len(selected_rows) / max(1, len(chunk_rows))),
+        "selected_ratio_effective": float(len(selected_rows) / max(1, len(train_rows_effective))),
         "selected_jsonl": str(selected_path),
         "next_checkpoint": str(final_ckpt),
         "alpha_json": str(args.alpha_json),
@@ -954,9 +1071,10 @@ def main() -> None:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
     logging.info(
-        "Chunk done. selected=%d/%d, result=%s",
+        "Chunk done. selected=%d/%d (effective=%d), result=%s",
         len(selected_rows),
         len(chunk_rows),
+        len(train_rows_effective),
         result_path,
     )
 

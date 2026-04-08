@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-chunks", type=int, default=10)
     parser.add_argument("--total-epochs", type=int, default=4)
     parser.add_argument("--shuffle-before-chunk", type=int, default=1)
+    parser.add_argument(
+        "--epoch1-target-size",
+        type=int,
+        default=0,
+        help="Hard cap for epoch-1 selected dataset size. 0 means no cap (use all kept samples).",
+    )
 
     # module 2 params
     parser.add_argument("--capability-key", type=str, default="auto")
@@ -90,10 +96,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--keep-threshold", type=float, default=0.5)
     parser.add_argument("--keep-ratio", type=float, default=0.5)
     parser.add_argument("--softmax-temperature", type=float, default=1.0)
+    parser.add_argument("--score-ema-momentum", type=float, default=0.02)
+    parser.add_argument("--min-keep-prob", type=float, default=0.05)
+    parser.add_argument("--keep-every-n", type=int, default=32)
     parser.add_argument("--reward-weight", type=float, default=0.5)
     parser.add_argument("--data-weight", type=float, default=0.5)
     parser.add_argument("--alpha-ema", type=float, default=0.1)
     parser.add_argument("--alpha-temperature", type=float, default=1.0)
+    parser.add_argument("--min-response-tokens", type=int, default=4)
     parser.add_argument(
         "--chunk-grad-param-mode",
         type=str,
@@ -163,9 +173,12 @@ def append_selected_dedup(
     selected_file: Path,
     chunk_selected_rows: list[dict[str, Any]],
     seen_ids: set[str],
+    max_append: int = 0,
 ) -> int:
     filtered: list[dict[str, Any]] = []
     for i, row in enumerate(chunk_selected_rows):
+        if max_append > 0 and len(filtered) >= max_append:
+            break
         rid = choose_row_id(row, i)
         if rid in seen_ids:
             continue
@@ -224,6 +237,11 @@ def main() -> None:
 
     logging.info("Prepared %d chunks from %d samples", len(chunk_files), len(rows))
 
+    epoch1_target_size = 0
+    if int(args.epoch1_target_size) > 0:
+        epoch1_target_size = min(max(1, int(args.epoch1_target_size)), len(rows))
+        logging.info("Epoch-1 hard target size enabled: %d", epoch1_target_size)
+
     py = sys.executable
     module2 = Path(__file__).resolve().parent / "update_beta_anchors.py"
     module1 = Path(__file__).resolve().parent / "train_dynamic_chunk.py"
@@ -242,6 +260,14 @@ def main() -> None:
     chunk_stats: list[dict[str, Any]] = []
 
     for i, chunk_file in enumerate(chunk_files):
+        if epoch1_target_size > 0 and len(seen_selected_ids) >= epoch1_target_size:
+            logging.info(
+                "Epoch-1 target reached (%d/%d). Stop scheduling remaining chunks.",
+                len(seen_selected_ids),
+                epoch1_target_size,
+            )
+            break
+
         logging.info("[Chunk %d/%d] start", i + 1, len(chunk_files))
 
         # module 2: update beta + anchor grads
@@ -361,6 +387,12 @@ def main() -> None:
             str(args.keep_ratio),
             "--softmax-temperature",
             str(args.softmax_temperature),
+            "--score-ema-momentum",
+            str(args.score_ema_momentum),
+            "--min-keep-prob",
+            str(args.min_keep_prob),
+            "--keep-every-n",
+            str(args.keep_every_n),
             "--reward-weight",
             str(args.reward_weight),
             "--data-weight",
@@ -369,6 +401,8 @@ def main() -> None:
             str(args.alpha_ema),
             "--alpha-temperature",
             str(args.alpha_temperature),
+            "--min-response-tokens",
+            str(args.min_response_tokens),
             "--grad-param-mode",
             args.chunk_grad_param_mode,
             "--grad-param-filter",
@@ -407,10 +441,15 @@ def main() -> None:
         else:
             chunk_selected_rows = []
 
+        remaining = 0
+        if epoch1_target_size > 0:
+            remaining = max(0, epoch1_target_size - len(seen_selected_ids))
+
         appended = append_selected_dedup(
             selected_file=selected_epoch1,
             chunk_selected_rows=chunk_selected_rows,
             seen_ids=seen_selected_ids,
+            max_append=remaining,
         )
 
         chunk_stats.append(
@@ -437,6 +476,13 @@ def main() -> None:
         static_output_root = args.static_output_root or (args.output_dir / "static_stage")
         static_output_root.mkdir(parents=True, exist_ok=True)
         static_run_dir = static_output_root / "run_recipe_selected"
+        resume_adapter_ckpt: str | None = None
+        ckpt_path = Path(str(current_checkpoint))
+        if ckpt_path.exists() and (ckpt_path / "adapter_config.json").exists():
+            resume_adapter_ckpt = str(ckpt_path)
+            logging.info("Static stage will resume from epoch-1 adapter: %s", resume_adapter_ckpt)
+        else:
+            logging.info("Static stage starts from base model (no adapter checkpoint found at %s).", current_checkpoint)
 
         cmd_static = [
             py,
@@ -472,6 +518,8 @@ def main() -> None:
             "--eval-ratio",
             str(args.eval_ratio),
         ]
+        if resume_adapter_ckpt is not None:
+            cmd_static.extend(["--init_adapter_checkpoint", resume_adapter_ckpt])
 
         if args.modelscope_cache_dir is not None:
             cmd_static.extend(["--modelscope_cache_dir", str(args.modelscope_cache_dir)])
@@ -495,6 +543,7 @@ def main() -> None:
                 "reason": "ok",
                 "command": cmd_static,
                 "static_epochs": static_epochs,
+                "resume_adapter_checkpoint": resume_adapter_ckpt,
                 "static_output_root": str(static_output_root),
             }
 
@@ -508,6 +557,7 @@ def main() -> None:
         "total_epochs": int(args.total_epochs),
         "selected_epoch1_jsonl": str(selected_epoch1),
         "selected_epoch1_size": int(len(seen_selected_ids)),
+        "epoch1_target_size": int(epoch1_target_size),
         "final_checkpoint_after_epoch1": str(current_checkpoint),
         "chunk_stats": chunk_stats,
         "static_stage": static_stage_info,

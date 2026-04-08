@@ -271,7 +271,8 @@ python src/4.3/run_orchestrator.py \
   --beta-ema 0.2 \
   --shared-eval-jsonl data/dolly/test.jsonl \
   --run-static-stage 1 \
-  --seed 42
+  --seed 42 \
+  --epoch1-target-size 130
 
 
 
@@ -281,7 +282,7 @@ python src/4.1/EXP/eval_checkpoints_em.py \
   --eval-size 1446 \
   --base_model Qwen/Qwen2.5-0.5B \
   --model_source modelscope \
-  --run re::data/dolly/exp4.7.1/run_dolly_recipe/final
+  --run re::data/dolly/exp4.3/decoupled_run1/static_stage/run_recipe_selected/final_checkpoint
 
 
 
