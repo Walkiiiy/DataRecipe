@@ -103,6 +103,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-weight", type=float, default=0.5)
     parser.add_argument("--alpha-ema", type=float, default=0.1)
     parser.add_argument("--alpha-temperature", type=float, default=1.0)
+    parser.add_argument("--alpha-lr", type=float, default=0.8)
+    parser.add_argument("--alpha-signal-ema", type=float, default=0.05)
+    parser.add_argument("--reward-ema-momentum", type=float, default=0.02)
+    parser.add_argument("--min-alpha", type=float, default=0.02)
     parser.add_argument("--min-response-tokens", type=int, default=4)
     parser.add_argument(
         "--chunk-grad-param-mode",
@@ -401,6 +405,14 @@ def main() -> None:
             str(args.alpha_ema),
             "--alpha-temperature",
             str(args.alpha_temperature),
+            "--alpha-lr",
+            str(args.alpha_lr),
+            "--alpha-signal-ema",
+            str(args.alpha_signal_ema),
+            "--reward-ema-momentum",
+            str(args.reward_ema_momentum),
+            "--min-alpha",
+            str(args.min_alpha),
             "--min-response-tokens",
             str(args.min_response_tokens),
             "--grad-param-mode",

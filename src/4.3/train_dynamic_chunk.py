@@ -83,6 +83,15 @@ class DynamicSelectorState:
     min_keep_prob: float
     keep_every_n: int
 
+    # Online alpha dynamics (method-level)
+    reward_ema_mean: float
+    reward_ema_var: float
+    reward_ema_momentum: float
+    alpha_signal_ema: float
+    alpha_lr: float
+    min_alpha: float
+    utility_ema: torch.Tensor  # (K,), CPU float32
+
     kept_local_indices: list[int]
     seen_kept: set[int]
 
@@ -246,13 +255,59 @@ class DynamicChunkTrainer(SFTTrainer):
         mapper_util: torch.Tensor,  # (B, K)
         reward_scaled: torch.Tensor,  # (B,)
     ) -> None:
-        utilities = (reward_scaled.unsqueeze(1) * mapper_util).mean(dim=0)  # (K,)
-        target = torch.softmax(utilities / max(self.selector_state.alpha_temperature, 1e-6), dim=0)
+        # Use method-relative signal (within-sample z-score across methods) to
+        # avoid scale collapse after global normalization. Then weight it by
+        # reward advantage vs running reward baseline.
+        if mapper_util.numel() == 0:
+            return
 
-        alpha = self.selector_state.alpha.to(target.device)
-        ema = min(max(self.selector_state.alpha_ema, 0.0), 1.0)
-        alpha = (1.0 - ema) * alpha + ema * target
-        alpha = alpha.clamp_min(0.0)
+        device = mapper_util.device
+        k = int(mapper_util.size(1))
+        if k <= 0:
+            return
+
+        mu = mapper_util.mean(dim=1, keepdim=True)
+        sigma = mapper_util.std(dim=1, unbiased=False, keepdim=True).clamp_min(1e-6)
+        method_rel = (mapper_util - mu) / sigma  # (B,K), centered per sample
+        method_signal = method_rel.mean(dim=0)  # (K,)
+
+        r = float(reward_scaled.detach().mean().item())
+        r_mom = float(min(max(self.selector_state.reward_ema_momentum, 1e-4), 1.0))
+        r_mean_old = float(self.selector_state.reward_ema_mean)
+        r_mean_new = (1.0 - r_mom) * r_mean_old + r_mom * r
+        r_var_new = (1.0 - r_mom) * float(self.selector_state.reward_ema_var) + r_mom * ((r - r_mean_new) ** 2)
+        r_std_new = max(math.sqrt(max(r_var_new, 1e-8)), 1e-6)
+        reward_adv = float((r - r_mean_new) / r_std_new)
+        self.selector_state.reward_ema_mean = r_mean_new
+        self.selector_state.reward_ema_var = max(r_var_new, 1e-8)
+
+        signal = method_signal * reward_adv  # (K,)
+        util_ema = self.selector_state.utility_ema.to(device=device, dtype=torch.float32)
+        sig_mom = float(min(max(self.selector_state.alpha_signal_ema, 1e-4), 1.0))
+        if util_ema.numel() != k:
+            util_ema = torch.zeros((k,), dtype=torch.float32, device=device)
+        util_ema = (1.0 - sig_mom) * util_ema + sig_mom * signal
+        self.selector_state.utility_ema = util_ema.detach().cpu()
+
+        alpha_old = self.selector_state.alpha.to(device=device, dtype=torch.float32)
+        if alpha_old.numel() != k:
+            alpha_old = torch.full((k,), 1.0 / float(k), dtype=torch.float32, device=device)
+        logits = torch.log(alpha_old.clamp_min(EPS))
+        temp = float(max(self.selector_state.alpha_temperature, 1e-6))
+        lr = float(max(self.selector_state.alpha_lr, 1e-6))
+        target = torch.softmax(logits + lr * (util_ema / temp), dim=0)
+
+        # Optional floor to avoid early collapse
+        min_alpha = float(max(0.0, self.selector_state.min_alpha))
+        if min_alpha > 0.0:
+            max_floor = 0.99 / float(k)
+            floor = min(min_alpha, max_floor)
+            target = target * (1.0 - floor * float(k)) + floor
+            target = target / target.sum().clamp_min(EPS)
+
+        ema = float(min(max(self.selector_state.alpha_ema, 0.0), 1.0))
+        alpha = (1.0 - ema) * alpha_old + ema * target
+        alpha = alpha.clamp_min(EPS)
         alpha = alpha / alpha.sum().clamp_min(EPS)
         self.selector_state.alpha = alpha.detach().cpu()
 
@@ -396,6 +451,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-weight", type=float, default=0.5)
     parser.add_argument("--alpha-ema", type=float, default=0.1)
     parser.add_argument("--alpha-temperature", type=float, default=1.0)
+    parser.add_argument("--alpha-lr", type=float, default=0.8)
+    parser.add_argument("--alpha-signal-ema", type=float, default=0.05)
+    parser.add_argument("--reward-ema-momentum", type=float, default=0.02)
+    parser.add_argument("--min-alpha", type=float, default=0.02)
     parser.add_argument(
         "--min-response-tokens",
         type=int,
@@ -967,6 +1026,13 @@ def main() -> None:
         score_ema_momentum=float(args.score_ema_momentum),
         min_keep_prob=float(args.min_keep_prob),
         keep_every_n=int(args.keep_every_n),
+        reward_ema_mean=0.5,
+        reward_ema_var=1.0,
+        reward_ema_momentum=float(args.reward_ema_momentum),
+        alpha_signal_ema=float(args.alpha_signal_ema),
+        alpha_lr=float(args.alpha_lr),
+        min_alpha=float(args.min_alpha),
+        utility_ema=torch.zeros((k_methods,), dtype=torch.float32),
         kept_local_indices=[],
         seen_kept=set(),
     )
