@@ -160,12 +160,13 @@ LLM 返回严格 JSON，二选一：
 ```bash
 export DEEPSEEK_API_KEY="your_api_key"
 
-python src/4.1/llm_capability_tree_builder.py \
-    --input-jsonl data/alpaca-gpt4-data-en/train.jsonl \
-    --max-samples 1000 \
+python src/4.1.1/llm_capability_tree_builder.py \
+    --input-jsonl data/dolly/train.jsonl \
+    --max-samples 100 \
     --shuffle \
     --shuffle-seed 42 \
     --embedding-model sentence-transformers/all-MiniLM-L6-v2 \
+    --api-key "sk-e02008970d074a01ae71f371e217f9aa" \
     --device auto \
     --model deepseek-chat \
     --base-url https://api.deepseek.com \
@@ -284,3 +285,23 @@ numpy
 ```
 
 LLM 接口默认使用 DeepSeek API（兼容 OpenAI 格式），通过环境变量 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY` 传入密钥，`OPENAI_BASE_URL` 可自定义 API 地址。
+
+
+
+
+
+DEEPSEEK_API_KEY="$(tr -d '\n\r' < .apikey)" HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 conda run -n DataRecipe python src/4.1.2/llm_capability_tree_builder.py \
+  --input-jsonl data/dolly/train.jsonl \
+  --output-tree-json data/dolly/capability_tree_final_4_1_2_fixed_anchor.json \
+  --output-summary-json data/dolly/capability_tree_summary_4_1_2_fixed_anchor.json \
+  --output-decisions-jsonl data/dolly/capability_tree_decisions_4_1_2_fixed_anchor.jsonl \
+  --max-samples 1000 --shuffle --shuffle-seed 42 \
+  --embedding-model sentence-transformers/all-MiniLM-L6-v2 --device auto \
+  --capability-text-mode category_aware --routing-mode hybrid \
+  --min-assign-cosine 0.08 \
+  --warm-start-mode category --warm-start-samples 50 \
+  --min-node-size-for-split 10 --max-split-k 6 \
+  --min-child-size-for-split 3 --min-split-silhouette 0.10 \
+  --intrinsic-dim 16 --split-gain-scale 1.0 --split-random-seed 42 \
+  --patience-structure-stable 0 --stale-singleton-rounds 0 \
+  --log-every 50 --print-tree-every 50
